@@ -1,18 +1,15 @@
 {
   "schemaVersion": 1,
-  "id": "lordzinka",
+  "id": "lordzinka-client",
   "version": "1.0.0",
   "name": "Lordzinka Client",
-  "description": "Lordzinka safe demo client",
-  "authors": ["Lordzinka"],
-  "license": "All-Rights-Reserved",
   "environment": "client",
   "entrypoints": {
     "client": ["com.lordzinka.client.LordzinkaClient"]
   },
   "depends": {
-    "fabricloader": ">=0.16.0",
-    "minecraft": "~1.21.11",
-    "java": ">=21"
+    "fabricloader": ">=0.18.4",
+    "minecraft": "1.21.11",
+    "fabric-api": "*"
   }
 }
