@@ -15,7 +15,9 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
 import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.entity.LivingEntity;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.ChatScreen;
@@ -84,6 +86,48 @@ public class LordzinkaClient implements ClientModInitializer {
     static int entityRange = 256;    // entity ESP draw distance
     static int alertRadius = 60;     // player radar radius
     static int totemDelay = 2;       // ticks between totem swaps
+    // HUD
+    static boolean hudInfo = true, hudCoords = true, hudFps = true, hudList = true, hudBanner = true, rainbow = true;
+    static int accentHue = 200;
+    // Chunk Finder
+    static int chunkMax = 40, chunkRange = 512, chunkSpeed = 2, chunkRescan = 100;
+    static boolean chunkLabels = true;
+    // Block ESP
+    static int blockMax = 800, blockFillAlpha = 25;
+    static boolean blockFill = false, blockLabels = false;
+    // Amethyst ESP
+    static int amRange = 256, amMax = 12, amMinPct = 0;
+    static boolean amBudding = true;
+    // Entity ESP
+    static int espStyle = 0;
+    static boolean espLabels = true, espDistance = true;
+    static int huePlayer = 0, hueHostile = 30, huePassive = 120, hueItem = 195, hueVehicle = 50;
+    // Nametags
+    static int ntRange = 160;
+    static boolean ntHealth = true, ntDistance = true, ntArmor = true, ntItem = true, ntPing = false, ntBackground = true;
+    // Tracers
+    static boolean trChunks = true, trEntities = true, trGeodes = true;
+    static int trOrigin = 0;
+    // Player Radar
+    static int radarList = 5;
+    static boolean radarSound = true, radarChat = true;
+    // Vanish Detect
+    static boolean vanTab = true, vanSpec = true, vanChat = true;
+    // Auto Totem
+    static int totemHealth = 0;
+    static boolean totemHotbar = true, totemWarn = true;
+    // Chunk Finder style
+    static int chunkStyle = 0;        // 0 square, 1 column, 2 box
+    static int chunkYMode = 0;        // 0 detected, 1 fixed
+    static int chunkY = 60, chunkHeight = 16, chunkColorMode = 0, chunkHue = 20, chunkAlpha = 30;
+    static boolean chunkFill = true, chunkOutline = true;
+    // Hole ESP
+    static boolean holesOn = true, holeFill = true, holeOutline = true, holeFloor = false, holeLabels = true;
+    static int holeRange = 16, holeVRange = 32, holeMin = 3, holeMaxLen = 128, holeCap = 60;
+    static int holeHue = 28, holeHue2 = 350, holeMode = 0, holeAlpha = 35;
+    // extras
+    static boolean espFill = false, espHealthBar = true, amFill = true, trHoles = true, hudNether = true;
+    static int espFillAlpha = 15;
     static final Set<Block> espBlocks = new HashSet<>();
 
     // ------------------------------------------------------------------ data
@@ -116,6 +160,8 @@ public class LordzinkaClient implements ClientModInitializer {
     static List<Geode> geodes = new ArrayList<>();
     static final List<Nearby> nearby = new ArrayList<>();
     static final Set<UUID> inRange = new HashSet<>();
+    static final Map<UUID, String> inRangeNames = new HashMap<>();
+    static int lastTotems = 0;
     static final Set<UUID> vanishWarned = new HashSet<>();
     static final Set<UUID> spectatorWarned = new HashSet<>();
     static final Map<UUID, String> vanishNow = new LinkedHashMap<>();
@@ -179,18 +225,16 @@ public class LordzinkaClient implements ClientModInitializer {
     // ------------------------------------------------------------------ init
     @Override
     public void onInitializeClient() {
-        for (Block b : new Block[]{Blocks.CHEST, Blocks.TRAPPED_CHEST, Blocks.BARREL, Blocks.ENDER_CHEST,
-                Blocks.SPAWNER, Blocks.BEACON, Blocks.ENCHANTING_TABLE}) espBlocks.add(b);
-        for (Block b : Registries.BLOCK)
-            if (Registries.BLOCK.getId(b).getPath().endsWith("shulker_box")) espBlocks.add(b);
-
+        buildGroups();
         buildModules();
         loadConfig();
         ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> queue.add(chunk.getPos().toLong()));
         ClientTickEvents.END_CLIENT_TICK.register(this::tick);
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             data.clear(); queue.clear(); geodes = new ArrayList<>(); nearby.clear();
-            inRange.clear(); vanishWarned.clear(); spectatorWarned.clear(); vanishNow.clear();
+            inRange.clear(); inRangeNames.clear(); vanishWarned.clear(); spectatorWarned.clear(); vanishNow.clear();
+            lastTotems = 0;
+            holes = new ArrayList<>();
         });
         HudElementRegistry.attachElementAfter(VanillaHudElements.MISC_OVERLAYS,
                 Identifier.of("lordzinka", "overlay"), this::render);
@@ -204,22 +248,32 @@ public class LordzinkaClient implements ClientModInitializer {
         handleGuiKey(mc);
 
         scanQueue(mc);
-        if (radarOn) updateRadar(mc); else { nearby.clear(); inRange.clear(); }
+        if (radarOn) updateRadar(mc); else { nearby.clear(); inRange.clear(); inRangeNames.clear(); }
         if (vanishOn && tickCounter % 20 == 0) updateVanish(mc);
         if (amethystOn && tickCounter % 40 == 0) computeGeodes(mc);
-        if (totemOn) autoTotem(mc);
+        if (holesOn) { if (tickCounter % 10 == 0) scanHoles(mc); } else if (!holes.isEmpty()) holes = new ArrayList<>();
+        if (totemOn) {
+            autoTotem(mc);
+            if (totemWarn && tickCounter % 10 == 0) {
+                int n = countTotems(mc);
+                if (n == 0 && lastTotems > 0) chat(mc, "Out of totems!");
+                lastTotems = n;
+            }
+        } else {
+            lastTotems = 0;
+        }
     }
 
     // ---- chunk scanning
     void scanQueue(MinecraftClient mc) {
-        if (tickCounter % 100 == 0) {
+        if (chunkRescan > 0 && tickCounter % chunkRescan == 0) {
             ChunkPos pc = mc.player.getChunkPos();
             for (int dx = -3; dx <= 3; dx++)
                 for (int dz = -3; dz <= 3; dz++)
                     queue.add(ChunkPos.toLong(pc.x + dx, pc.z + dz));
         }
         Iterator<Long> it = queue.iterator();
-        int budget = 2;
+        int budget = chunkSpeed;
         while (it.hasNext() && budget-- > 0) {
             long k = it.next();
             it.remove();
@@ -300,17 +354,20 @@ public class LordzinkaClient implements ClientModInitializer {
             if (d > alertRadius) continue;
             nearby.add(new Nearby(p.getUuid(), p.getName().getString(), d, p.getHealth() + p.getAbsorptionAmount(), p.getBlockPos()));
             now.add(p.getUuid());
+            inRangeNames.put(p.getUuid(), p.getName().getString());
             if (inRange.add(p.getUuid())) {
-                chat(mc, String.format("%s entered %dm range (%d away) at %d, %d, %d", p.getName().getString(),
-                        alertRadius, (int) d, p.getBlockX(), p.getBlockY(), p.getBlockZ()));
-                mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 0.5f);
+                if (radarChat)
+                    chat(mc, String.format("%s entered %dm range (%d away) at %d, %d, %d", p.getName().getString(),
+                            alertRadius, (int) d, p.getBlockX(), p.getBlockY(), p.getBlockZ()));
+                if (radarSound) mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 0.5f);
             }
         }
         for (Iterator<UUID> it = inRange.iterator(); it.hasNext(); ) {
             UUID id = it.next();
             if (!now.contains(id)) {
                 it.remove();
-                chat(mc, "A player left your " + alertRadius + "m range");
+                String nm = inRangeNames.remove(id);
+                if (radarChat) chat(mc, (nm != null ? nm : "A player") + " left your " + alertRadius + "m range");
             }
         }
         nearby.sort(Comparator.comparingDouble(Nearby::dist));
@@ -326,19 +383,20 @@ public class LordzinkaClient implements ClientModInitializer {
         vanishNow.clear();
         for (AbstractClientPlayerEntity p : mc.world.getPlayers()) {
             if (p == mc.player) continue;
-            if (nh.getPlayerListEntry(p.getUuid()) == null) {
+            if (vanTab && nh.getPlayerListEntry(p.getUuid()) == null) {
                 vanishNow.put(p.getUuid(), p.getName().getString());
-                if (vanishWarned.add(p.getUuid()))
+                if (vanishWarned.add(p.getUuid()) && vanChat)
                     chat(mc, "Possible VANISHED player (no tab entry): " + p.getName().getString()
                             + " at " + p.getBlockX() + ", " + p.getBlockY() + ", " + p.getBlockZ());
             }
         }
+        if (!vanSpec) return;
         for (PlayerListEntry e : nh.getPlayerList()) {
             UUID id = e.getProfile().id();
             if (mc.player.getUuid().equals(id)) continue;
             if (e.getGameMode() == GameMode.SPECTATOR) {
                 vanishNow.put(id, e.getProfile().name() + " (spectator)");
-                if (spectatorWarned.add(id))
+                if (spectatorWarned.add(id) && vanChat)
                     chat(mc, "Player in SPECTATOR mode (possible staff): " + e.getProfile().name());
             }
         }
@@ -350,8 +408,9 @@ public class LordzinkaClient implements ClientModInitializer {
         if (mc.interactionManager == null) return;
         if (mc.player.currentScreenHandler != mc.player.playerScreenHandler) return;
         if (mc.player.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) return;
+        if (totemHealth > 0 && mc.player.getHealth() + mc.player.getAbsorptionAmount() > totemHealth) return;
         // screen-handler slots: 9-35 main inventory, 36-44 hotbar
-        for (int i = 9; i <= 44; i++) {
+        for (int i = 9; i <= (totemHotbar ? 44 : 35); i++) {
             ItemStack s = mc.player.playerScreenHandler.getSlot(i).getStack();
             if (s.isOf(Items.TOTEM_OF_UNDYING)) {
                 mc.interactionManager.clickSlot(mc.player.playerScreenHandler.syncId, i, 40, SlotActionType.SWAP, mc.player);
@@ -537,7 +596,9 @@ public class LordzinkaClient implements ClientModInitializer {
                 if ((i & bit) == 0) line3(g, c[i], c[i | bit], col);
     }
 
-    static double[] box2(DrawContext g, Box b, int col) {
+    static double[] box2(DrawContext g, Box b, int col) { return box2(g, b, col, 0); }
+
+    static double[] box2(DrawContext g, Box b, int col, int fill) {
         double[][] c = corners(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
         double minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
         for (double[] v : c) {
@@ -549,6 +610,7 @@ public class LordzinkaClient implements ClientModInitializer {
         if (maxX < 0 || maxY < 0 || minX > sw || minY > sh) return null;
         int x0 = (int) Math.max(-50, minX), y0 = (int) Math.max(-50, minY);
         int x1 = (int) Math.min(sw + 50, maxX), y1 = (int) Math.min(sh + 50, maxY);
+        if ((fill >>> 24) != 0) g.fill(x0, y0, x1 + 1, y1 + 1, fill);
         g.fill(x0, y0, x1 + 1, y0 + 1, col);
         g.fill(x0, y1, x1 + 1, y1 + 1, col);
         g.fill(x0, y0, x0 + 1, y1 + 1, col);
@@ -560,7 +622,7 @@ public class LordzinkaClient implements ClientModInitializer {
         double[] c = cam(x, y, z);
         if (c[2] < NEAR) return;
         double[] s = scr(c);
-        line2(g, sw / 2, sh, s[0], s[1], col);
+        line2(g, sw / 2, trOrigin == 1 ? sh / 2 : sh, s[0], s[1], col);
     }
 
     static int hsv(float h, float s, float v) {
@@ -584,6 +646,188 @@ public class LordzinkaClient implements ClientModInitializer {
         return 0xFF000000 | ((int) (80 + 175 * t) << 16) | ((int) (230 - 190 * t) << 8) | 0x40;
     }
 
+    // ------------------------------------------------------------------ drawing helpers
+    static int withAlpha(int rgb, int pct) {
+        return (Math.max(0, Math.min(255, pct * 255 / 100)) << 24) | (rgb & 0xFFFFFF);
+    }
+
+    static int mulAlpha(int argb, double k) {
+        int a = (int) Math.max(0, Math.min(255, (argb >>> 24) * k));
+        return (a << 24) | (argb & 0xFFFFFF);
+    }
+
+    static int lerpColor(int a, int b, float t) {
+        t = Math.max(0f, Math.min(1f, t));
+        int r = (int) (((a >> 16) & 255) * (1 - t) + ((b >> 16) & 255) * t);
+        int gr = (int) (((a >> 8) & 255) * (1 - t) + ((b >> 8) & 255) * t);
+        int bl = (int) ((a & 255) * (1 - t) + (b & 255) * t);
+        return 0xFF000000 | (r << 16) | (gr << 8) | bl;
+    }
+
+    static int hpColor(double ratio) { return ratio > 0.66 ? 0xFF55FF55 : ratio > 0.33 ? 0xFFFFDD44 : 0xFFFF5555; }
+
+    /** Fills a convex polygon given in camera space (clipped against the near plane). */
+    static void fillPoly(DrawContext g, double[][] pts, int argb) {
+        List<double[]> clipped = new ArrayList<>();
+        int n0 = pts.length;
+        for (int i = 0; i < n0; i++) {
+            double[] a = pts[i], b = pts[(i + 1) % n0];
+            boolean ai = a[2] >= NEAR, bi = b[2] >= NEAR;
+            if (ai) clipped.add(a);
+            if (ai != bi) clipped.add(ai ? clipNear(b, a) : clipNear(a, b));
+        }
+        int n = clipped.size();
+        if (n < 3) return;
+        double[][] sp = new double[n][];
+        double minY = Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+        for (int i = 0; i < n; i++) {
+            sp[i] = scr(clipped.get(i));
+            minY = Math.min(minY, sp[i][1]);
+            maxY = Math.max(maxY, sp[i][1]);
+        }
+        int y0 = (int) Math.max(0, Math.floor(minY));
+        int y1 = (int) Math.min(sh - 1, Math.ceil(maxY));
+        for (int y = y0; y <= y1; y++) {
+            double yc = y + 0.5, xl = Double.MAX_VALUE, xr = -Double.MAX_VALUE;
+            for (int i = 0; i < n; i++) {
+                double[] p = sp[i], q = sp[(i + 1) % n];
+                if ((p[1] <= yc && q[1] > yc) || (q[1] <= yc && p[1] > yc)) {
+                    double x = p[0] + (yc - p[1]) / (q[1] - p[1]) * (q[0] - p[0]);
+                    xl = Math.min(xl, x);
+                    xr = Math.max(xr, x);
+                }
+            }
+            if (xl > xr) continue;
+            int a = (int) Math.max(0, Math.round(xl)), b = (int) Math.min(sw, Math.round(xr));
+            if (b > a) g.fill(a, y, b, y + 1, argb);
+        }
+    }
+
+    static final int[][] FACES = {{0, 2, 6, 4}, {1, 3, 7, 5}, {0, 1, 5, 4}, {2, 3, 7, 6}, {0, 1, 3, 2}, {4, 5, 7, 6}};
+    static final double[] FACE_K = {1.0, 0.85, 0.5, 0.75, 0.9, 0.7};
+
+    /** Translucent 3D box (each face shaded a bit differently so it reads as a solid). */
+    static void fillBox3(DrawContext g, double x0, double y0, double z0, double x1, double y1, double z1, int argb) {
+        double[][] c = corners(x0, y0, z0, x1, y1, z1);
+        for (int f = 0; f < 6; f++) {
+            int[] ix = FACES[f];
+            fillPoly(g, new double[][]{c[ix[0]], c[ix[1]], c[ix[2]], c[ix[3]]}, mulAlpha(argb, FACE_K[f]));
+        }
+    }
+
+    static double[] screenRect(Box b) {
+        double[][] c = corners(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
+        double minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+        for (double[] v : c) {
+            if (v[2] < NEAR) return null;
+            double[] s = scr(v);
+            minX = Math.min(minX, s[0]); maxX = Math.max(maxX, s[0]);
+            minY = Math.min(minY, s[1]); maxY = Math.max(maxY, s[1]);
+        }
+        if (maxX < 0 || maxY < 0 || minX > sw || minY > sh) return null;
+        return new double[]{minX, minY, maxX, maxY};
+    }
+
+    static void rectOutline(DrawContext g, int x0, int y0, int x1, int y1, int col) {
+        g.fill(x0, y0, x1 + 1, y0 + 1, col);
+        g.fill(x0, y1, x1 + 1, y1 + 1, col);
+        g.fill(x0, y0, x0 + 1, y1 + 1, col);
+        g.fill(x1, y0, x1 + 1, y1 + 1, col);
+    }
+
+    static void rectCorners(DrawContext g, int x0, int y0, int x1, int y1, int col) {
+        int lw = Math.max(3, (x1 - x0) / 4), lh = Math.max(3, (y1 - y0) / 4);
+        g.fill(x0, y0, x0 + lw, y0 + 1, col);
+        g.fill(x0, y0, x0 + 1, y0 + lh, col);
+        g.fill(x1 - lw + 1, y0, x1 + 1, y0 + 1, col);
+        g.fill(x1, y0, x1 + 1, y0 + lh, col);
+        g.fill(x0, y1, x0 + lw, y1 + 1, col);
+        g.fill(x0, y1 - lh + 1, x0 + 1, y1 + 1, col);
+        g.fill(x1 - lw + 1, y1, x1 + 1, y1 + 1, col);
+        g.fill(x1, y1 - lh + 1, x1 + 1, y1 + 1, col);
+    }
+
+    // ------------------------------------------------------------------ hole detection
+    static final class Hole {
+        final int x, z, y0, y1;   // y0 = bottom, y1 = top (inclusive)
+        final double dist;
+        Hole(int x, int z, int y0, int y1, double dist) { this.x = x; this.z = z; this.y0 = y0; this.y1 = y1; this.dist = dist; }
+    }
+
+    static List<Hole> holes = new ArrayList<>();
+
+    static boolean solidAt(ClientWorld w, BlockPos.Mutable m, int x, int y, int z) {
+        m.set(x, y, z);
+        return w.getBlockState(m).isSolidBlock(w, m);
+    }
+
+    static boolean holeCell(ClientWorld w, BlockPos.Mutable m, int x, int y, int z) {
+        m.set(x, y, z);
+        BlockState s = w.getBlockState(m);
+        if (!s.isAir()) return false;
+        return solidAt(w, m, x + 1, y, z) && solidAt(w, m, x - 1, y, z)
+                && solidAt(w, m, x, y, z + 1) && solidAt(w, m, x, y, z - 1);
+    }
+
+    /** A hole is a 1x1 vertical shaft of air with solid blocks on all four sides. */
+    void scanHoles(MinecraftClient mc) {
+        ClientWorld w = mc.world;
+        BlockPos pp = mc.player.getBlockPos();
+        int r = holeRange;
+        int yMin = Math.max(w.getBottomY() + 1, pp.getY() - holeVRange);
+        int yMax = Math.min(w.getBottomY() + w.getHeight() - 2, pp.getY() + holeVRange);
+        BlockPos.Mutable m = new BlockPos.Mutable();
+        List<Hole> out = new ArrayList<>();
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dz = -r; dz <= r; dz++) {
+                int x = pp.getX() + dx, z = pp.getZ() + dz;
+                if (w.getChunkManager().getWorldChunk(x >> 4, z >> 4) == null) continue;
+                int runStart = Integer.MIN_VALUE;
+                for (int y = yMin; y <= yMax + 1; y++) {
+                    boolean hole = y <= yMax && holeCell(w, m, x, y, z);
+                    if (hole) {
+                        if (runStart == Integer.MIN_VALUE) runStart = y;
+                    } else if (runStart != Integer.MIN_VALUE) {
+                        int len = y - runStart;
+                        if (len >= holeMin && len <= holeMaxLen && (!holeFloor || solidAt(w, m, x, runStart - 1, z))) {
+                            double ddx = x + 0.5 - mc.player.getX(), ddz = z + 0.5 - mc.player.getZ();
+                            out.add(new Hole(x, z, runStart, y - 1, ddx * ddx + ddz * ddz));
+                        }
+                        runStart = Integer.MIN_VALUE;
+                    }
+                }
+            }
+        }
+        out.sort(Comparator.comparingDouble(h -> h.dist));
+        holes = out.size() > holeCap ? new ArrayList<>(out.subList(0, holeCap)) : out;
+    }
+
+    void renderHoles(DrawContext g, MinecraftClient mc) {
+        var tr = mc.textRenderer;
+        for (Hole h : holes) {
+            int len = h.y1 - h.y0 + 1;
+            int col = holeMode == 1
+                    ? lerpColor(hueColor(holeHue), hueColor(holeHue2), Math.min(1f, (len - holeMin) / 12f))
+                    : hueColor(holeHue);
+            double x0 = h.x, z0 = h.z;
+            double[] cc = cam(x0 + 0.5, (h.y0 + h.y1 + 1) / 2.0, z0 + 0.5);
+            if (cc[2] < -len) continue;
+            if (holeFill) fillBox3(g, x0, h.y0, z0, x0 + 1, h.y1 + 1, z0 + 1, withAlpha(col, holeAlpha));
+            if (holeOutline) box3(g, x0, h.y0, z0, x0 + 1, h.y1 + 1, z0 + 1, col);
+            if (tracers && trHoles) tracerTo(g, x0 + 0.5, (h.y0 + h.y1 + 1) / 2.0, z0 + 0.5, col);
+            if (holeLabels) {
+                double[] c = cam(x0 + 0.5, h.y1 + 1.6, z0 + 0.5);
+                if (c[2] > NEAR) {
+                    double[] s = scr(c);
+                    String t = len + "m hole";
+                    int tw = tr.getWidth(t);
+                    g.fill((int) s[0] - tw / 2 - 2, (int) s[1] - 1, (int) s[0] + tw / 2 + 2, (int) s[1] + 9, 0x80000000);
+                    g.drawTextWithShadow(tr, t, (int) s[0] - tw / 2, (int) s[1], col);
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ rendering
     void render(DrawContext g, RenderTickCounter rtc) {
         MinecraftClient mc = MinecraftClient.getInstance();
@@ -595,6 +839,7 @@ public class LordzinkaClient implements ClientModInitializer {
         Map<Long, ChunkInfo> map = chunks(mc);
 
         if (chunksOn) renderChunks(g, mc, map);
+        if (holesOn) renderHoles(g, mc);
         if (blocksOn) renderBlocks(g, mc, map);
         if (amethystOn) renderGeodes(g, tr);
         if (espOn) renderEntities(g, mc, tp);
@@ -604,63 +849,124 @@ public class LordzinkaClient implements ClientModInitializer {
 
     void renderChunks(DrawContext g, MinecraftClient mc, Map<Long, ChunkInfo> map) {
         var tr = mc.textRenderer;
+        double rangeSq = (double) chunkRange * chunkRange;
         List<ChunkInfo> flagged = new ArrayList<>();
         for (ChunkInfo ci : map.values()) {
             double dx = ci.cx * 16 + 8 - ex, dz = ci.cz * 16 + 8 - ez;
-            if (ci.score >= threshold && dx * dx + dz * dz < 512 * 512) flagged.add(ci);
+            if (ci.score >= threshold && dx * dx + dz * dz < rangeSq) flagged.add(ci);
         }
         flagged.sort(Comparator.comparingDouble(ci -> Math.pow(ci.cx * 16 + 8 - ex, 2) + Math.pow(ci.cz * 16 + 8 - ez, 2)));
-        for (int i = 0; i < Math.min(40, flagged.size()); i++) {
+        int n = Math.min(chunkMax, flagged.size());
+        for (int i = 0; i < n; i++) {
             ChunkInfo ci = flagged.get(i);
             float ratio = Math.min(1f, ci.score / (threshold * 3f));
-            int col = 0xFF000000 | 0xFF0000 | ((int) (220 - 180 * ratio) << 8);
+            int col = chunkColorMode == 0
+                    ? (0xFF000000 | 0xFF0000 | ((int) (220 - 180 * ratio) << 8))
+                    : hueColor(chunkHue);
             double x0 = ci.cx * 16, z0 = ci.cz * 16;
-            box3(g, x0, ci.minY, z0, x0 + 16, ci.maxY + 1, z0 + 16, col);
-            if (tracers) tracerTo(g, x0 + 8, (ci.minY + ci.maxY + 1) / 2.0, z0 + 8, col);
-            double[] c = cam(x0 + 8, ci.maxY + 1.5, z0 + 8);
-            if (c[2] > NEAR) {
-                double[] s = scr(c);
-                String label = String.format("Chunk %d,%d  score %.0f", ci.cx, ci.cz, ci.score);
-                g.drawTextWithShadow(tr, label, (int) s[0] - tr.getWidth(label) / 2, (int) s[1], col);
+            boolean fixed = chunkYMode == 1;
+            double yLow, yHigh;
+            if (chunkStyle == 0) {                       // flat square
+                yLow = yHigh = fixed ? chunkY : ci.maxY + 1;
+            } else if (chunkStyle == 1) {                // column from the base upwards
+                yLow = fixed ? chunkY : ci.minY;
+                yHigh = yLow + chunkHeight;
+            } else {                                     // box around the detected blocks
+                yLow = fixed ? chunkY : ci.minY;
+                yHigh = fixed ? chunkY + chunkHeight : ci.maxY + 1;
+            }
+            boolean doFill = chunkFill && i < 14;        // filling is the expensive part, so only the nearest chunks
+            int fillCol = withAlpha(col, chunkAlpha);
+            if (chunkStyle == 0) {
+                if (doFill)
+                    fillPoly(g, new double[][]{cam(x0, yLow, z0), cam(x0 + 16, yLow, z0),
+                            cam(x0 + 16, yLow, z0 + 16), cam(x0, yLow, z0 + 16)}, fillCol);
+            } else if (doFill) {
+                fillBox3(g, x0, yLow, z0, x0 + 16, yHigh, z0 + 16, fillCol);
+            }
+            if (chunkOutline) box3(g, x0, yLow, z0, x0 + 16, yHigh, z0 + 16, col);
+            double yMid = (yLow + yHigh) / 2.0;
+            if (tracers && trChunks) tracerTo(g, x0 + 8, yMid, z0 + 8, col);
+            if (chunkLabels) {
+                double[] c = cam(x0 + 8, yHigh + 1.5, z0 + 8);
+                if (c[2] > NEAR) {
+                    double[] s = scr(c);
+                    double dx = x0 + 8 - ex, dz = z0 + 8 - ez;
+                    String label = String.format("Chunk %d,%d  score %.0f  %dm", ci.cx, ci.cz, ci.score, (int) Math.sqrt(dx * dx + dz * dz));
+                    int tw = tr.getWidth(label);
+                    g.fill((int) s[0] - tw / 2 - 2, (int) s[1] - 1, (int) s[0] + tw / 2 + 2, (int) s[1] + 9, 0x80000000);
+                    g.drawTextWithShadow(tr, label, (int) s[0] - tw / 2, (int) s[1], col);
+                }
             }
         }
     }
 
     void renderBlocks(DrawContext g, MinecraftClient mc, Map<Long, ChunkInfo> map) {
+        var tr = mc.textRenderer;
         int drawn = 0;
         double rangeSq = (double) blockRange * blockRange;
         for (ChunkInfo ci : map.values()) {
             double cdx = ci.cx * 16 + 8 - ex, cdz = ci.cz * 16 + 8 - ez;
             if (cdx * cdx + cdz * cdz > (blockRange + 24.0) * (blockRange + 24.0)) continue;
-            for (int i = 0; i < ci.esp.size() && drawn < 800; i++) {
+            for (int i = 0; i < ci.esp.size(); i++) {
+                if (drawn >= blockMax) return;
                 BlockPos pos = BlockPos.fromLong(ci.esp.getLong(i));
                 double dx = pos.getX() + 0.5 - ex, dy = pos.getY() + 0.5 - ey, dz = pos.getZ() + 0.5 - ez;
-                if (dx * dx + dy * dy + dz * dz > rangeSq) continue;
+                double distSq = dx * dx + dy * dy + dz * dz;
+                if (distSq > rangeSq) continue;
                 Block block = mc.world.getBlockState(pos).getBlock();
                 boolean loaded = mc.world.getChunkManager().getWorldChunk(pos.getX() >> 4, pos.getZ() >> 4) != null;
                 if (loaded && !espBlocks.contains(block)) continue;
-                int col = blockColor(loaded ? block : Blocks.CHEST);
-                if (box2(g, new Box(pos), col) != null) drawn++;
+                Block shown = loaded ? block : Blocks.CHEST;
+                int col = blockColor(shown);
+                double[] r = box2(g, new Box(pos), col, blockFill ? withAlpha(col, blockFillAlpha) : 0);
+                if (r == null) continue;
+                drawn++;
+                if (blockLabels) {
+                    String t = shown.getName().getString() + " " + (int) Math.sqrt(distSq) + "m";
+                    g.drawTextWithShadow(tr, t, (int) ((r[0] + r[2]) / 2) - tr.getWidth(t) / 2, (int) r[1] - 10, col);
+                }
             }
         }
     }
 
     void renderGeodes(DrawContext g, net.minecraft.client.font.TextRenderer tr) {
         int shown = 0;
+        double rr = (double) amRange * amRange;
         for (Geode ge : geodes) {
-            if (shown >= 12) break;
+            if (shown >= amMax) break;
+            if (ge.likelihood < amMinPct) continue;
             double dx = ge.cx() - ex, dz = ge.cz() - ez;
-            if (dx * dx + dz * dz > 256 * 256) continue;
+            if (dx * dx + dz * dz > rr) continue;
             shown++;
             int col = riskColor(ge.likelihood);
+            if (amFill) fillBox3(g, ge.minX, ge.minY, ge.minZ, ge.maxX + 1, ge.maxY + 1, ge.maxZ + 1, withAlpha(col, 16));
             box3(g, ge.minX, ge.minY, ge.minZ, ge.maxX + 1, ge.maxY + 1, ge.maxZ + 1, col);
+            if (tracers && trGeodes) tracerTo(g, ge.cx(), ge.cy(), ge.cz(), col);
             double[] c = cam(ge.cx(), ge.maxY + 1.5, ge.cz());
             if (c[2] > NEAR) {
                 double[] s = scr(c);
                 String l1 = "Amethyst Geode";
                 String l2 = String.format("clusters %d | budding %d | base %.0f%%", ge.clusters, ge.budding, ge.likelihood);
+                int w = Math.max(tr.getWidth(l1), tr.getWidth(l2));
+                g.fill((int) s[0] - w / 2 - 3, (int) s[1] - 12, (int) s[0] + w / 2 + 3, (int) s[1] + 10, 0x90101018);
+                g.fill((int) s[0] - w / 2 - 3, (int) s[1] + 9, (int) s[0] + w / 2 + 3, (int) s[1] + 10, col);
                 g.drawTextWithShadow(tr, l1, (int) s[0] - tr.getWidth(l1) / 2, (int) s[1] - 10, 0xFFD58CFF);
                 g.drawTextWithShadow(tr, l2, (int) s[0] - tr.getWidth(l2) / 2, (int) s[1], col);
+            }
+        }
+        if (amBudding) {
+            int n = 0;
+            double lim = Math.min(amRange, 96);
+            double r2 = lim * lim;
+            for (ChunkInfo ci : chunks(MinecraftClient.getInstance()).values()) {
+                if (n >= 250) break;
+                for (long l : ci.amBudding) {
+                    BlockPos pos = BlockPos.fromLong(l);
+                    double dx = pos.getX() + 0.5 - ex, dy = pos.getY() + 0.5 - ey, dz = pos.getZ() + 0.5 - ez;
+                    if (dx * dx + dy * dy + dz * dz > r2) continue;
+                    if (box2(g, new Box(pos), 0xFFD58CFF, withAlpha(0xD58CFF, 28)) != null && ++n >= 250) break;
+                }
             }
         }
     }
@@ -671,135 +977,191 @@ public class LordzinkaClient implements ClientModInitializer {
         for (Entity e : mc.world.getEntities()) {
             if (e == mc.player) continue;
             int col;
-            if (e instanceof PlayerEntity) { if (!fPlayers) continue; col = 0xFFFF3333; }
-            else if (e instanceof HostileEntity) { if (!fHostile) continue; col = 0xFFFF8800; }
-            else if (e instanceof PassiveEntity) { if (!fPassive) continue; col = 0xFF44DD44; }
-            else if (e instanceof ItemEntity) { if (!fItems) continue; col = 0xFF33CCFF; }
+            if (e instanceof PlayerEntity) { if (!fPlayers) continue; col = hueColor(huePlayer); }
+            else if (e instanceof HostileEntity) { if (!fHostile) continue; col = hueColor(hueHostile); }
+            else if (e instanceof PassiveEntity) { if (!fPassive) continue; col = hueColor(huePassive); }
+            else if (e instanceof ItemEntity) { if (!fItems) continue; col = hueColor(hueItem); }
             else {
                 String id = Registries.ENTITY_TYPE.getId(e.getType()).getPath();
                 if (!fVehicles || !(id.contains("minecart") || id.contains("boat") || id.contains("raft"))) continue;
-                col = 0xFFFFDD33;
+                col = hueColor(hueVehicle);
             }
             Vec3d lp = e.getLerpedPos(tp);
             double dx = lp.x - ex, dy = lp.y - ey, dz = lp.z - ez;
             double distSq = dx * dx + dy * dy + dz * dz;
             if (distSq > rangeSq) continue;
             Box b = e.getBoundingBox().offset(lp.x - e.getX(), lp.y - e.getY(), lp.z - e.getZ());
-            double[] r = box2(g, b, col);
-            if (tracers) tracerTo(g, lp.x, lp.y + e.getHeight() / 2, lp.z, col);
-            if (r != null && !(e instanceof PlayerEntity && nametagsOn)) {
-                String label = e.getName().getString() + " [" + (int) Math.sqrt(distSq) + "m]";
-                g.drawTextWithShadow(tr, label, (int) ((r[0] + r[2]) / 2) - tr.getWidth(label) / 2, (int) r[1] - 10, col);
+            int fill = espFill ? withAlpha(col, espFillAlpha) : 0;
+            double[] lab = null;
+            if (espStyle == 2) {
+                if (espFill) fillBox3(g, b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ, fill);
+                box3(g, b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ, col);
+                double[] c = cam(lp.x, lp.y + e.getHeight() + 0.25, lp.z);
+                if (c[2] > NEAR) { double[] s = scr(c); lab = new double[]{s[0], s[1]}; }
+            } else {
+                double[] r = screenRect(b);
+                if (r != null) {
+                    int x0 = (int) Math.max(-50, r[0]), y0 = (int) Math.max(-50, r[1]);
+                    int x1 = (int) Math.min(sw + 50, r[2]), y1 = (int) Math.min(sh + 50, r[3]);
+                    if (fill != 0) g.fill(x0, y0, x1 + 1, y1 + 1, fill);
+                    if (espStyle == 1) rectCorners(g, x0, y0, x1, y1, col); else rectOutline(g, x0, y0, x1, y1, col);
+                    if (espHealthBar && e instanceof LivingEntity le) {
+                        double ratio = Math.min(1.0, (le.getHealth() + le.getAbsorptionAmount()) / Math.max(1f, le.getMaxHealth()));
+                        int bh = y1 - y0, fh = (int) (bh * ratio);
+                        g.fill(x0 - 5, y0 - 1, x0 - 2, y1 + 2, 0xAA000000);
+                        g.fill(x0 - 4, y1 + 1 - fh, x0 - 3, y1 + 1, hpColor(ratio));
+                    }
+                    lab = new double[]{(r[0] + r[2]) / 2, r[1]};
+                }
+            }
+            if (tracers && trEntities) tracerTo(g, lp.x, lp.y + e.getHeight() / 2, lp.z, col);
+            if (espLabels && lab != null && !(e instanceof PlayerEntity && nametagsOn)) {
+                String name = e instanceof ItemEntity ie
+                        ? ie.getStack().getName().getString() + " x" + ie.getStack().getCount()
+                        : e.getName().getString();
+                String label = espDistance ? name + " [" + (int) Math.sqrt(distSq) + "m]" : name;
+                g.drawTextWithShadow(tr, label, (int) lab[0] - tr.getWidth(label) / 2, (int) lab[1] - 10, col);
             }
         }
     }
 
     void renderNametags(DrawContext g, MinecraftClient mc, float tp) {
         var tr = mc.textRenderer;
+        ClientPlayNetworkHandler nh = mc.getNetworkHandler();
         for (AbstractClientPlayerEntity p : mc.world.getPlayers()) {
             if (p == mc.player) continue;
             Vec3d lp = p.getLerpedPos(tp);
             double dist = Math.sqrt(Math.pow(lp.x - ex, 2) + Math.pow(lp.y - ey, 2) + Math.pow(lp.z - ez, 2));
-            if (dist > 160) continue;
+            if (dist > ntRange) continue;
             double[] c = cam(lp.x, lp.y + p.getHeight() + 0.75, lp.z);
             if (c[2] < NEAR) continue;
             double[] s = scr(c);
             float hp = p.getHealth() + p.getAbsorptionAmount();
             int hpCol = hp >= 15 ? 0xFF55FF55 : hp >= 8 ? 0xFFFFDD44 : 0xFFFF5555;
             String name = p.getName().getString();
-            String stats = String.format(" %dhp  %dm", (int) Math.ceil(hp), (int) dist);
-            int w = tr.getWidth(name) + tr.getWidth(stats);
-            int x = (int) s[0] - w / 2, y = (int) s[1] - 22;
-
-            // armor durability line
-            StringBuilder armor = new StringBuilder();
-            for (EquipmentSlot slot : new EquipmentSlot[]{EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET}) {
-                ItemStack st = p.getEquippedStack(slot);
-                armor.append(st.isEmpty() ? "-" : st.getMaxDamage() <= 0 ? "#"
-                        : String.valueOf(Math.max(0, 100 - st.getDamage() * 100 / st.getMaxDamage()) / 10)).append(' ');
+            StringBuilder st = new StringBuilder();
+            if (ntHealth) st.append("  ").append((int) Math.ceil(hp)).append("hp");
+            if (ntDistance) st.append("  ").append((int) dist).append('m');
+            if (ntPing && nh != null) {
+                PlayerListEntry pe = nh.getPlayerListEntry(p.getUuid());
+                if (pe != null) st.append("  ").append(pe.getLatency()).append("ms");
             }
-            ItemStack held = p.getMainHandStack();
-            String l2 = "[" + armor.toString().trim() + "]  " + (held.isEmpty() ? "empty hand" : held.getName().getString());
-            int w2 = tr.getWidth(l2);
+            String stats = st.toString();
+            int w = tr.getWidth(name) + tr.getWidth(stats);
+
+            List<String> parts = new ArrayList<>();
+            if (ntArmor) {
+                StringBuilder armor = new StringBuilder();
+                for (EquipmentSlot slot : new EquipmentSlot[]{EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET}) {
+                    ItemStack as = p.getEquippedStack(slot);
+                    armor.append(as.isEmpty() ? "-" : as.getMaxDamage() <= 0 ? "#"
+                            : String.valueOf(Math.max(0, 100 - as.getDamage() * 100 / as.getMaxDamage()) / 10)).append(' ');
+                }
+                parts.add("[" + armor.toString().trim() + "]");
+            }
+            if (ntItem) {
+                ItemStack held = p.getMainHandStack();
+                parts.add(held.isEmpty() ? "empty hand" : held.getName().getString());
+            }
+            String l2 = parts.isEmpty() ? null : String.join("  ", parts);
+            int w2 = l2 == null ? 0 : tr.getWidth(l2);
             int bw = Math.max(w, w2);
-            g.fill((int) s[0] - bw / 2 - 3, y - 2, (int) s[0] + bw / 2 + 3, y + 21, 0x99101018);
-            g.fill((int) s[0] - bw / 2 - 3, y - 2, (int) s[0] + bw / 2 + 3, y - 1, hpCol);
-            g.drawTextWithShadow(tr, name, x, y, 0xFFFFFFFF);
-            g.drawTextWithShadow(tr, stats, x + tr.getWidth(name), y, hpCol);
-            g.drawTextWithShadow(tr, l2, (int) s[0] - w2 / 2, y + 10, 0xFFBBBBBB);
+            int bh = (l2 == null ? 12 : 22) + 3;
+            int cx = (int) s[0], top = (int) s[1] - bh - 2;
+            if (ntBackground) {
+                g.fill(cx - bw / 2 - 5, top - 1, cx + bw / 2 + 5, top + bh + 1, 0x50000000);
+                g.fillGradient(cx - bw / 2 - 4, top, cx + bw / 2 + 4, top + bh, 0xD0202034, 0xD00C0C14);
+                int bar = (int) ((bw + 8) * Math.min(1f, hp / 20f));
+                g.fill(cx - bw / 2 - 4, top + bh - 2, cx + bw / 2 + 4, top + bh, 0x66000000);
+                g.fill(cx - bw / 2 - 4, top + bh - 2, cx - bw / 2 - 4 + bar, top + bh, hpCol);
+            }
+            g.drawTextWithShadow(tr, name, cx - w / 2, top + 3, 0xFFFFFFFF);
+            if (!stats.isEmpty()) g.drawTextWithShadow(tr, stats, cx - w / 2 + tr.getWidth(name), top + 3, hpCol);
+            if (l2 != null) g.drawTextWithShadow(tr, l2, cx - w2 / 2, top + 13, 0xFFBBBBCC);
         }
     }
 
     // ---- HUD
     void renderHud(DrawContext g, MinecraftClient mc) {
         var tr = mc.textRenderer;
-        int accent = hsv((System.currentTimeMillis() % 6000) / 6000f, 0.55f, 1f);
+        int accent = accent();
+        int accentDim = accent & 0xFFFFFF;
 
-        // --- left info panel
-        List<String> lines = new ArrayList<>();
-        List<Integer> cols = new ArrayList<>();
-        BlockPos bp = mc.player.getBlockPos();
-        lines.add(String.format("XYZ  %d  %d  %d", bp.getX(), bp.getY(), bp.getZ())); cols.add(0xFFFFFFFF);
-        lines.add(String.format("%s  |  %s  |  %d FPS", mc.player.getHorizontalFacing().asString(),
-                dimKey(mc).replace("minecraft:", ""), mc.getCurrentFps())); cols.add(0xFFBBBBCC);
-        int flagged = 0;
-        for (ChunkInfo ci : chunks(mc).values()) if (ci.score >= threshold) flagged++;
-        lines.add("Suspicious chunks: " + flagged); cols.add(flagged > 0 ? 0xFFFF7755 : 0xFFBBBBCC);
-        if (amethystOn) {
-            double best = 0;
-            for (Geode ge : geodes) best = Math.max(best, ge.likelihood);
-            lines.add(geodes.isEmpty() ? "Geodes: none" : String.format("Geodes: %d (best %.0f%%)", geodes.size(), best));
-            cols.add(geodes.isEmpty() ? 0xFFBBBBCC : riskColor(best));
+        if (hudInfo) {
+            List<String> lines = new ArrayList<>();
+            List<Integer> cols = new ArrayList<>();
+            BlockPos bp = mc.player.getBlockPos();
+            String dk = dimKey(mc);
+            if (hudCoords) {
+                lines.add(String.format("XYZ  %d  %d  %d", bp.getX(), bp.getY(), bp.getZ())); cols.add(0xFFFFFFFF);
+                if (hudNether && !dk.contains("end")) {
+                    boolean nether = dk.contains("nether");
+                    lines.add(String.format("%s  %d  %d", nether ? "Overworld" : "Nether",
+                            nether ? bp.getX() * 8 : Math.floorDiv(bp.getX(), 8),
+                            nether ? bp.getZ() * 8 : Math.floorDiv(bp.getZ(), 8)));
+                    cols.add(nether ? 0xFF77DD77 : 0xFFFF8866);
+                }
+            }
+            lines.add(String.format(hudFps ? "%s  |  %s  |  %d FPS" : "%s  |  %s", mc.player.getHorizontalFacing().asString(),
+                    dk.replace("minecraft:", ""), mc.getCurrentFps())); cols.add(0xFFBBBBCC);
+            int flagged = 0;
+            for (ChunkInfo ci : chunks(mc).values()) if (ci.score >= threshold) flagged++;
+            lines.add("Suspicious chunks: " + flagged); cols.add(flagged > 0 ? 0xFFFF7755 : 0xFFBBBBCC);
+            if (holesOn) { lines.add("Holes: " + holes.size()); cols.add(holes.isEmpty() ? 0xFFBBBBCC : hueColor(holeHue)); }
+            if (amethystOn) {
+                double best = 0;
+                for (Geode ge : geodes) best = Math.max(best, ge.likelihood);
+                lines.add(geodes.isEmpty() ? "Geodes: none" : String.format("Geodes: %d (best %.0f%%)", geodes.size(), best));
+                cols.add(geodes.isEmpty() ? 0xFFBBBBCC : riskColor(best));
+            }
+            if (totemOn) { lines.add("Totems: " + countTotems(mc)); cols.add(0xFFFFD84A); }
+            if (radarOn) {
+                lines.add("Players <" + alertRadius + "m: " + nearby.size()); cols.add(nearby.isEmpty() ? 0xFFBBBBCC : 0xFFFF5555);
+                for (int i = 0; i < Math.min(radarList, nearby.size()); i++) {
+                    Nearby n = nearby.get(i);
+                    lines.add(String.format("  %s  %dm  %dhp", n.name(), (int) n.dist(), (int) Math.ceil(n.hp())));
+                    cols.add(0xFFFF8888);
+                }
+            }
+            if (vanishOn && !vanishNow.isEmpty()) {
+                lines.add("Vanish suspects: " + vanishNow.size()); cols.add(0xFFFFAA33);
+                int k = 0;
+                for (String nm : vanishNow.values()) { if (k++ >= 3) break; lines.add("  " + nm); cols.add(0xFFFFCC77); }
+            }
+            int w = tr.getWidth(NAME) + 14;
+            for (String l : lines) w = Math.max(w, tr.getWidth(l) + 14);
+            int h = 18 + lines.size() * 10 + 5;
+            int x = 4, y = 4;
+            g.fill(x - 1, y - 1, x + w + 1, y + h + 1, 0x50000000);
+            g.fillGradient(x, y, x + w, y + h, 0xD0202034, 0xC00C0C14);
+            g.fillGradient(x, y, x + 2, y + h, accent, accentDim);
+            g.fillGradient(x, y, x + w, y + 14, 0x30FFFFFF, 0x00FFFFFF);
+            g.fillGradient(x + 2, y + 14, x + w, y + 15, accent, accentDim);
+            g.drawTextWithShadow(tr, NAME, x + 8, y + 3, accent);
+            for (int i = 0; i < lines.size(); i++)
+                g.drawTextWithShadow(tr, lines.get(i), x + 8, y + 19 + i * 10, cols.get(i));
         }
-        if (totemOn) { lines.add("Totems: " + countTotems(mc)); cols.add(0xFFFFD84A); }
-        if (radarOn) {
-            lines.add("Players <" + alertRadius + "m: " + nearby.size()); cols.add(nearby.isEmpty() ? 0xFFBBBBCC : 0xFFFF5555);
-            for (int i = 0; i < Math.min(5, nearby.size()); i++) {
-                Nearby n = nearby.get(i);
-                lines.add(String.format("  %s  %dm  %dhp", n.name(), (int) n.dist(), (int) Math.ceil(n.hp())));
-                cols.add(0xFFFF8888);
+
+        if (hudList) {
+            List<Mod> act = new ArrayList<>();
+            for (Mod m : MODS) if (!m.cat.equals("Client") && m.get.getAsBoolean()) act.add(m);
+            act.sort((a, b) -> tr.getWidth(b.name) - tr.getWidth(a.name));
+            int ry = 4;
+            float t = (System.currentTimeMillis() % 6000) / 6000f;
+            for (int i = 0; i < act.size(); i++) {
+                String m = act.get(i).name;
+                int c = rainbow ? hsv(t + i * 0.045f, 0.55f, 1f) : accent;
+                int mw = tr.getWidth(m);
+                int rx0 = (int) sw - mw - 10;
+                g.fill(rx0 - 3, ry, (int) sw - 3, ry + 11, 0x90101018);
+                g.fill((int) sw - 3, ry, (int) sw - 1, ry + 11, c);
+                g.fill(rx0 - 3, ry, rx0 - 2, ry + 11, mulAlpha(c, 0.5));
+                g.drawTextWithShadow(tr, m, rx0, ry + 2, c);
+                ry += 11;
             }
         }
-        if (vanishOn && !vanishNow.isEmpty()) {
-            lines.add("Vanish suspects: " + vanishNow.size()); cols.add(0xFFFFAA33);
-            int k = 0;
-            for (String nm : vanishNow.values()) { if (k++ >= 3) break; lines.add("  " + nm); cols.add(0xFFFFCC77); }
-        }
-        int w = tr.getWidth(NAME) + 12;
-        for (String l : lines) w = Math.max(w, tr.getWidth(l) + 12);
-        int h = 16 + lines.size() * 10 + 4;
-        int x = 4, y = 4;
-        g.fill(x, y, x + w, y + h, 0xB0101018);
-        g.fill(x, y, x + 2, y + h, accent);
-        g.fill(x + 2, y + 13, x + w, y + 14, 0x40FFFFFF);
-        g.drawTextWithShadow(tr, NAME, x + 7, y + 3, accent);
-        for (int i = 0; i < lines.size(); i++)
-            g.drawTextWithShadow(tr, lines.get(i), x + 7, y + 18 + i * 10, cols.get(i));
 
-        // --- right module list
-        List<String> mods = new ArrayList<>();
-        if (chunksOn) mods.add("Chunk Finder");
-        if (blocksOn) mods.add("Block ESP");
-        if (amethystOn) mods.add("Amethyst ESP");
-        if (espOn) mods.add("Entity ESP");
-        if (radarOn) mods.add("Player Radar");
-        if (nametagsOn) mods.add("Nametags");
-        if (vanishOn) mods.add("Vanish Detect");
-        if (totemOn) mods.add("Auto Totem");
-        if (tracers) mods.add("Tracers");
-        mods.sort((a, b) -> tr.getWidth(b) - tr.getWidth(a));
-        int ry = 4;
-        for (String m : mods) {
-            int mw = tr.getWidth(m);
-            int rx0 = (int) sw - mw - 9;
-            g.fill(rx0 - 2, ry, (int) sw - 3, ry + 11, 0x90101018);
-            g.fill((int) sw - 3, ry, (int) sw - 1, ry + 11, accent);
-            g.drawTextWithShadow(tr, m, rx0, ry + 2, accent);
-            ry += 11;
-        }
-
-        // --- player alert banner
-        if (radarOn && !nearby.isEmpty()) {
+        if (hudBanner && radarOn && !nearby.isEmpty()) {
             StringBuilder sb = new StringBuilder("[!] PLAYER NEARBY: ");
             for (int i = 0; i < Math.min(3, nearby.size()); i++) {
                 if (i > 0) sb.append(", ");
@@ -809,7 +1171,8 @@ public class LordzinkaClient implements ClientModInitializer {
             int tw = tr.getWidth(t);
             boolean pulse = (System.currentTimeMillis() / 400) % 2 == 0;
             int bx = (int) sw / 2 - tw / 2;
-            g.fill(bx - 8, 18, bx + tw + 8, 34, pulse ? 0xC0801010 : 0xC0501010);
+            g.fill(bx - 9, 17, bx + tw + 9, 35, 0x50000000);
+            g.fillGradient(bx - 8, 18, bx + tw + 8, 34, pulse ? 0xD0A01818 : 0xD0601010, pulse ? 0xD0601010 : 0xD0401010);
             g.fill(bx - 8, 18, bx + tw + 8, 19, 0xFFFF4444);
             g.drawTextWithShadow(tr, t, bx, 23, 0xFFFFFFFF);
         }
@@ -854,6 +1217,7 @@ public class LordzinkaClient implements ClientModInitializer {
         root.then(toggle("vanish", () -> vanishOn = !vanishOn));
         root.then(toggle("totem", () -> totemOn = !totemOn));
         root.then(toggle("tracers", () -> tracers = !tracers));
+        root.then(toggle("holes", () -> holesOn = !holesOn));
         root.then(toggle("notify", () -> notify = !notify));
         root.then(ClientCommandManager.literal("filter")
                 .then(toggle("players", () -> fPlayers = !fPlayers))
@@ -938,19 +1302,54 @@ public class LordzinkaClient implements ClientModInitializer {
     static abstract class Setting {
         final String name;
         Setting(String n) { name = n; }
+        abstract String save();
+        abstract void load(String v);
     }
 
     static final class BoolS extends Setting {
         final BooleanSupplier get;
         final Consumer<Boolean> set;
         BoolS(String n, BooleanSupplier g, Consumer<Boolean> s) { super(n); get = g; set = s; }
+        @Override String save() { return String.valueOf(get.getAsBoolean()); }
+        @Override void load(String v) { set.accept(Boolean.parseBoolean(v.trim())); }
     }
 
-    static final class IntS extends Setting {
+    static class IntS extends Setting {
         final int min, max;
         final IntSupplier get;
         final IntConsumer set;
         IntS(String n, int min, int max, IntSupplier g, IntConsumer s) { super(n); this.min = min; this.max = max; get = g; set = s; }
+        @Override String save() { return String.valueOf(get.getAsInt()); }
+        @Override void load(String v) { set.accept(Math.max(min, Math.min(max, Integer.parseInt(v.trim())))); }
+    }
+
+    /** Hue slider 0-359. */
+    static final class ColorS extends IntS {
+        ColorS(String n, IntSupplier g, IntConsumer s) { super(n, 0, 359, g, s); }
+    }
+
+    static final class EnumS extends Setting {
+        final String[] options;
+        final IntSupplier get;
+        final IntConsumer set;
+        EnumS(String n, String[] o, IntSupplier g, IntConsumer s) { super(n); options = o; get = g; set = s; }
+        void cycle(int d) { int n = options.length; set.accept(((get.getAsInt() + d) % n + n) % n); }
+        String current() { return options[Math.max(0, Math.min(options.length - 1, get.getAsInt()))]; }
+        @Override String save() { return String.valueOf(get.getAsInt()); }
+        @Override void load(String v) { int i = Integer.parseInt(v.trim()); if (i >= 0 && i < options.length) set.accept(i); }
+    }
+
+    /** Keyboard bind (GLFW key code, 0 = none). */
+    static final class BindS extends Setting {
+        final IntSupplier get;
+        final IntConsumer set;
+        boolean canClear = true;
+        BindS(String n, IntSupplier g, IntConsumer s) { super(n); get = g; set = s; }
+        @Override String save() { return String.valueOf(get.getAsInt()); }
+        @Override void load(String v) {
+            int k = Integer.parseInt(v.trim());
+            if (k >= 0 && k <= GLFW.GLFW_KEY_LAST) set.accept(k);
+        }
     }
 
     static final class Mod {
@@ -958,40 +1357,235 @@ public class LordzinkaClient implements ClientModInitializer {
         final BooleanSupplier get;
         final Consumer<Boolean> set;
         final List<Setting> settings = new ArrayList<>();
+        final BindS bind;
+        String desc = "";
+        int key = 0;
         boolean open;
+        float anim;
         Mod(String name, String cat, BooleanSupplier get, Consumer<Boolean> set) {
             this.name = name; this.cat = cat; this.get = get; this.set = set;
+            this.bind = new BindS("Bind", () -> key, k -> key = k);
+            settings.add(bind);
         }
         Mod with(Setting s) { settings.add(s); return this; }
+        Mod info(String d) { desc = d; return this; }
     }
 
     static final List<Mod> MODS = new ArrayList<>();
-    static boolean openGuiRequested, rsWas, guiWasOpen;
+    static final Map<String, int[]> GUI_POS = new LinkedHashMap<>();
+    static final Set<String> COLLAPSED = new HashSet<>();
+    static final boolean[] keyWas = new boolean[GLFW.GLFW_KEY_LAST + 1];
+    static Mod guiMod;
+    static BindS listening;
+    static boolean openGuiRequested, guiWasOpen;
+
+    static BoolS sb(String n, BooleanSupplier g, Consumer<Boolean> s) { return new BoolS(n, g, s); }
+    static IntS si(String n, int min, int max, IntSupplier g, IntConsumer s) { return new IntS(n, min, max, g, s); }
+    static ColorS sc(String n, IntSupplier g, IntConsumer s) { return new ColorS(n, g, s); }
+    static EnumS se(String n, String[] o, IntSupplier g, IntConsumer s) { return new EnumS(n, o, g, s); }
+
+    static final Map<String, List<Block>> GROUPS = new LinkedHashMap<>();
+
+    static void buildGroups() {
+        GROUPS.put("Chests", List.of(Blocks.CHEST, Blocks.TRAPPED_CHEST));
+        GROUPS.put("Ender Chests", List.of(Blocks.ENDER_CHEST));
+        GROUPS.put("Barrels", List.of(Blocks.BARREL));
+        List<Block> shulkers = new ArrayList<>();
+        for (Block b : Registries.BLOCK)
+            if (Registries.BLOCK.getId(b).getPath().endsWith("shulker_box")) shulkers.add(b);
+        GROUPS.put("Shulkers", shulkers);
+        GROUPS.put("Spawners", List.of(Blocks.SPAWNER));
+        GROUPS.put("Beacons", List.of(Blocks.BEACON));
+        GROUPS.put("Ench. Tables", List.of(Blocks.ENCHANTING_TABLE));
+        GROUPS.put("Furnaces", List.of(Blocks.FURNACE, Blocks.BLAST_FURNACE, Blocks.SMOKER));
+        GROUPS.put("Hoppers", List.of(Blocks.HOPPER));
+        GROUPS.put("Dispensers", List.of(Blocks.DISPENSER, Blocks.DROPPER));
+        // enabled by default
+        for (String g : new String[]{"Chests", "Ender Chests", "Barrels", "Shulkers", "Spawners", "Beacons", "Ench. Tables"})
+            espBlocks.addAll(GROUPS.get(g));
+    }
 
     static void buildModules() {
+        // ---------------- Render
         MODS.add(new Mod("Chunk Finder", "Render", () -> chunksOn, v -> chunksOn = v)
-                .with(new IntS("Threshold", 1, 100, () -> threshold, v -> threshold = v)));
-        MODS.add(new Mod("Block ESP", "Render", () -> blocksOn, v -> blocksOn = v)
-                .with(new IntS("Range", 16, 512, () -> blockRange, v -> blockRange = v)));
-        MODS.add(new Mod("Amethyst ESP", "Render", () -> amethystOn, v -> amethystOn = v));
+                .info("Znajduje podejrzane chunki (bazy graczy). Kwadrat mozna ustawic na dowolnej wysokosci Y")
+                .with(si("Threshold", 1, 200, () -> threshold, v -> threshold = v))
+                .with(si("Max Chunks", 5, 100, () -> chunkMax, v -> chunkMax = v))
+                .with(si("Range", 64, 2048, () -> chunkRange, v -> chunkRange = v))
+                .with(se("Style", new String[]{"Square", "Column", "Box"}, () -> chunkStyle, v -> chunkStyle = v))
+                .with(se("Y Mode", new String[]{"Detected", "Fixed"}, () -> chunkYMode, v -> chunkYMode = v))
+                .with(si("Y Level", -64, 320, () -> chunkY, v -> chunkY = v))
+                .with(si("Height", 1, 256, () -> chunkHeight, v -> chunkHeight = v))
+                .with(se("Color Mode", new String[]{"Heat", "Custom"}, () -> chunkColorMode, v -> chunkColorMode = v))
+                .with(sc("Color", () -> chunkHue, v -> chunkHue = v))
+                .with(sb("Fill", () -> chunkFill, v -> chunkFill = v))
+                .with(si("Fill Opacity", 5, 80, () -> chunkAlpha, v -> chunkAlpha = v))
+                .with(sb("Outline", () -> chunkOutline, v -> chunkOutline = v))
+                .with(sb("Labels", () -> chunkLabels, v -> chunkLabels = v))
+                .with(si("Scan Speed", 1, 10, () -> chunkSpeed, v -> chunkSpeed = v))
+                .with(si("Rescan Ticks", 20, 600, () -> chunkRescan, v -> chunkRescan = v)));
+
+        MODS.add(new Mod("Hole ESP", "Render", () -> holesOn, v -> holesOn = v)
+                .info("Podswietla pionowe dziury 1x1 (jak pomaranczowa sciana). Ustaw minimalna dlugosc i kolor")
+                .with(si("Range", 4, 32, () -> holeRange, v -> holeRange = v))
+                .with(si("Vertical Range", 8, 64, () -> holeVRange, v -> holeVRange = v))
+                .with(si("Min Length", 1, 32, () -> holeMin, v -> holeMin = v))
+                .with(si("Max Length", 1, 128, () -> holeMaxLen, v -> holeMaxLen = v))
+                .with(si("Max Holes", 10, 200, () -> holeCap, v -> holeCap = v))
+                .with(sb("Require Floor", () -> holeFloor, v -> holeFloor = v))
+                .with(se("Color Mode", new String[]{"Single", "Depth"}, () -> holeMode, v -> holeMode = v))
+                .with(sc("Color", () -> holeHue, v -> holeHue = v))
+                .with(sc("Deep Color", () -> holeHue2, v -> holeHue2 = v))
+                .with(sb("Fill", () -> holeFill, v -> holeFill = v))
+                .with(si("Fill Opacity", 5, 80, () -> holeAlpha, v -> holeAlpha = v))
+                .with(sb("Outline", () -> holeOutline, v -> holeOutline = v))
+                .with(sb("Labels", () -> holeLabels, v -> holeLabels = v)));
+
+        Mod blockEsp = new Mod("Block ESP", "Render", () -> blocksOn, v -> blocksOn = v)
+                .info("Podswietla skrzynki, beczki, spawnery itp. przez sciany")
+                .with(si("Range", 16, 512, () -> blockRange, v -> blockRange = v))
+                .with(si("Max Boxes", 50, 3000, () -> blockMax, v -> blockMax = v))
+                .with(sb("Fill", () -> blockFill, v -> blockFill = v))
+                .with(si("Fill Opacity", 5, 60, () -> blockFillAlpha, v -> blockFillAlpha = v))
+                .with(sb("Labels", () -> blockLabels, v -> blockLabels = v));
+        for (Map.Entry<String, List<Block>> en : GROUPS.entrySet()) {
+            final List<Block> list = en.getValue();
+            blockEsp.with(sb(en.getKey(), () -> espBlocks.containsAll(list), v -> {
+                if (v) espBlocks.addAll(list); else espBlocks.removeAll(list);
+                rescanAll(MinecraftClient.getInstance());
+            }));
+        }
+        MODS.add(blockEsp);
+
+        MODS.add(new Mod("Amethyst ESP", "Render", () -> amethystOn, v -> amethystOn = v)
+                .info("Znajduje geody i ocenia, czy ktos juz je zebral")
+                .with(si("Range", 32, 512, () -> amRange, v -> amRange = v))
+                .with(si("Max Geodes", 1, 30, () -> amMax, v -> amMax = v))
+                .with(si("Min Chance %", 0, 99, () -> amMinPct, v -> amMinPct = v))
+                .with(sb("Fill", () -> amFill, v -> amFill = v))
+                .with(sb("Mark Budding", () -> amBudding, v -> amBudding = v)));
+
         MODS.add(new Mod("Entity ESP", "Render", () -> espOn, v -> espOn = v)
-                .with(new BoolS("Players", () -> fPlayers, v -> fPlayers = v))
-                .with(new BoolS("Hostile", () -> fHostile, v -> fHostile = v))
-                .with(new BoolS("Passive", () -> fPassive, v -> fPassive = v))
-                .with(new BoolS("Items", () -> fItems, v -> fItems = v))
-                .with(new BoolS("Vehicles", () -> fVehicles, v -> fVehicles = v))
-                .with(new IntS("Range", 16, 512, () -> entityRange, v -> entityRange = v)));
-        MODS.add(new Mod("Nametags", "Render", () -> nametagsOn, v -> nametagsOn = v));
-        MODS.add(new Mod("Tracers", "Render", () -> tracers, v -> tracers = v));
+                .info("Ramki wokol graczy, mobow, itemow i pojazdow")
+                .with(sb("Players", () -> fPlayers, v -> fPlayers = v))
+                .with(sb("Hostile", () -> fHostile, v -> fHostile = v))
+                .with(sb("Passive", () -> fPassive, v -> fPassive = v))
+                .with(sb("Items", () -> fItems, v -> fItems = v))
+                .with(sb("Vehicles", () -> fVehicles, v -> fVehicles = v))
+                .with(si("Range", 16, 512, () -> entityRange, v -> entityRange = v))
+                .with(se("Box", new String[]{"2D", "Corners", "3D"}, () -> espStyle, v -> espStyle = v))
+                .with(sb("Fill", () -> espFill, v -> espFill = v))
+                .with(si("Fill Opacity", 5, 60, () -> espFillAlpha, v -> espFillAlpha = v))
+                .with(sb("Health Bar", () -> espHealthBar, v -> espHealthBar = v))
+                .with(sb("Labels", () -> espLabels, v -> espLabels = v))
+                .with(sb("Distance", () -> espDistance, v -> espDistance = v))
+                .with(sc("Color Players", () -> huePlayer, v -> huePlayer = v))
+                .with(sc("Color Hostile", () -> hueHostile, v -> hueHostile = v))
+                .with(sc("Color Passive", () -> huePassive, v -> huePassive = v))
+                .with(sc("Color Items", () -> hueItem, v -> hueItem = v))
+                .with(sc("Color Vehicles", () -> hueVehicle, v -> hueVehicle = v)));
 
+        MODS.add(new Mod("Nametags", "Render", () -> nametagsOn, v -> nametagsOn = v)
+                .info("Rozbudowane tabliczki graczy: HP, pancerz, item w rece")
+                .with(si("Range", 16, 256, () -> ntRange, v -> ntRange = v))
+                .with(sb("Health", () -> ntHealth, v -> ntHealth = v))
+                .with(sb("Distance", () -> ntDistance, v -> ntDistance = v))
+                .with(sb("Armor", () -> ntArmor, v -> ntArmor = v))
+                .with(sb("Held Item", () -> ntItem, v -> ntItem = v))
+                .with(sb("Ping", () -> ntPing, v -> ntPing = v))
+                .with(sb("Background", () -> ntBackground, v -> ntBackground = v)));
+
+        MODS.add(new Mod("Tracers", "Render", () -> tracers, v -> tracers = v)
+                .info("Linie od ekranu do chunkow, dziur, graczy i geod")
+                .with(sb("Chunks", () -> trChunks, v -> trChunks = v))
+                .with(sb("Holes", () -> trHoles, v -> trHoles = v))
+                .with(sb("Entities", () -> trEntities, v -> trEntities = v))
+                .with(sb("Geodes", () -> trGeodes, v -> trGeodes = v))
+                .with(se("Origin", new String[]{"Bottom", "Center"}, () -> trOrigin, v -> trOrigin = v)));
+
+        // ---------------- Player
         MODS.add(new Mod("Player Radar", "Player", () -> radarOn, v -> radarOn = v)
-                .with(new IntS("Radius", 8, 128, () -> alertRadius, v -> alertRadius = v)));
-        MODS.add(new Mod("Vanish Detect", "Player", () -> vanishOn, v -> vanishOn = v));
-        MODS.add(new Mod("Auto Totem", "Player", () -> totemOn, v -> totemOn = v)
-                .with(new IntS("Delay", 0, 20, () -> totemDelay, v -> totemDelay = v)));
+                .info("Ostrzega, gdy gracz wejdzie w twoj zasieg")
+                .with(si("Radius", 8, 128, () -> alertRadius, v -> alertRadius = v))
+                .with(si("List Size", 1, 10, () -> radarList, v -> radarList = v))
+                .with(sb("Chat Alerts", () -> radarChat, v -> radarChat = v))
+                .with(sb("Sound", () -> radarSound, v -> radarSound = v)));
 
-        MODS.add(new Mod("HUD", "Client", () -> hudOn, v -> hudOn = v));
-        MODS.add(new Mod("Notifications", "Client", () -> notify, v -> notify = v));
+        MODS.add(new Mod("Vanish Detect", "Player", () -> vanishOn, v -> vanishOn = v)
+                .info("Wykrywa ukrytych graczy (vanish) i spectatorow")
+                .with(sb("No Tab Entry", () -> vanTab, v -> vanTab = v))
+                .with(sb("Spectators", () -> vanSpec, v -> vanSpec = v))
+                .with(sb("Chat Alerts", () -> vanChat, v -> vanChat = v)));
+
+        MODS.add(new Mod("Auto Totem", "Player", () -> totemOn, v -> totemOn = v)
+                .info("Automatycznie wklada totem do drugiej reki")
+                .with(si("Delay", 0, 20, () -> totemDelay, v -> totemDelay = v))
+                .with(si("HP Below (0=any)", 0, 20, () -> totemHealth, v -> totemHealth = v))
+                .with(sb("Hotbar", () -> totemHotbar, v -> totemHotbar = v))
+                .with(sb("Warn When Empty", () -> totemWarn, v -> totemWarn = v)));
+
+        // ---------------- Client
+        guiMod = new Mod("ClickGUI", "Client", () -> true, v -> { })
+                .info("To menu. Kliknij Bind i nacisnij dowolny klawisz, zeby zmienic przycisk otwierajacy");
+        guiMod.key = GLFW.GLFW_KEY_RIGHT_SHIFT;
+        guiMod.bind.canClear = false;
+        guiMod.with(sb("Rainbow", () -> rainbow, v -> rainbow = v))
+                .with(sc("Accent Hue", () -> accentHue, v -> accentHue = v));
+        MODS.add(guiMod);
+
+        MODS.add(new Mod("HUD", "Client", () -> hudOn, v -> hudOn = v)
+                .info("Panel informacji, lista modulow i alerty na ekranie")
+                .with(sb("Info Panel", () -> hudInfo, v -> hudInfo = v))
+                .with(sb("Coords", () -> hudCoords, v -> hudCoords = v))
+                .with(sb("Nether Coords", () -> hudNether, v -> hudNether = v))
+                .with(sb("FPS", () -> hudFps, v -> hudFps = v))
+                .with(sb("Module List", () -> hudList, v -> hudList = v))
+                .with(sb("Alert Banner", () -> hudBanner, v -> hudBanner = v)));
+        MODS.add(new Mod("Notifications", "Client", () -> notify, v -> notify = v)
+                .info("Wiadomosci na czacie o podejrzanych chunkach"));
+    }
+
+    static int accent() {
+        return rainbow ? hsv((System.currentTimeMillis() % 6000) / 6000f, 0.55f, 1f)
+                : hsv(accentHue / 360f, 0.6f, 1f);
+    }
+
+    static int hueColor(int hue) { return hsv(hue / 360f, 0.8f, 1f); }
+
+    static String keyName(int k) {
+        if (k <= 0) return "None";
+        switch (k) {
+            case 32: return "Space";
+            case 256: return "Esc";
+            case 257: return "Enter";
+            case 258: return "Tab";
+            case 259: return "Backspace";
+            case 260: return "Insert";
+            case 261: return "Delete";
+            case 262: return "Right";
+            case 263: return "Left";
+            case 264: return "Down";
+            case 265: return "Up";
+            case 266: return "PgUp";
+            case 267: return "PgDn";
+            case 268: return "Home";
+            case 269: return "End";
+            case 280: return "Caps";
+            case 340: return "L-Shift";
+            case 341: return "L-Ctrl";
+            case 342: return "L-Alt";
+            case 343: return "L-Super";
+            case 344: return "R-Shift";
+            case 345: return "R-Ctrl";
+            case 346: return "R-Alt";
+            case 347: return "R-Super";
+            case 348: return "Menu";
+            default: break;
+        }
+        if (k >= 290 && k <= 314) return "F" + (k - 289);
+        if (k >= 320 && k <= 329) return "Num" + (k - 320);
+        String n = GLFW.glfwGetKeyName(k, 0);
+        return n != null ? n.toUpperCase() : "Key" + k;
     }
 
     static Path cfgPath() {
@@ -1003,11 +1597,11 @@ public class LordzinkaClient implements ClientModInitializer {
         for (Mod m : MODS) {
             p.setProperty(m.name, String.valueOf(m.get.getAsBoolean()));
             for (Setting s : m.settings) {
-                String k = m.name + "." + s.name;
-                if (s instanceof BoolS b) p.setProperty(k, String.valueOf(b.get.getAsBoolean()));
-                else if (s instanceof IntS i) p.setProperty(k, String.valueOf(i.get.getAsInt()));
+                try { p.setProperty(m.name + "." + s.name, s.save()); } catch (Exception ignored) { }
             }
         }
+        for (Map.Entry<String, int[]> en : GUI_POS.entrySet())
+            p.setProperty("pos." + en.getKey(), en.getValue()[0] + "," + en.getValue()[1]);
         try (OutputStream o = Files.newOutputStream(cfgPath())) {
             p.store(o, NAME);
         } catch (Exception ignored) { }
@@ -1027,24 +1621,49 @@ public class LordzinkaClient implements ClientModInitializer {
             for (Setting s : m.settings) {
                 String v = p.getProperty(m.name + "." + s.name);
                 if (v == null) continue;
-                try {
-                    if (s instanceof BoolS b) b.set.accept(Boolean.parseBoolean(v));
-                    else if (s instanceof IntS i) i.set.accept(Math.max(i.min, Math.min(i.max, Integer.parseInt(v.trim()))));
-                } catch (Exception ignored) { }
+                try { s.load(v); } catch (Exception ignored) { }
             }
+        }
+        for (String k : p.stringPropertyNames()) {
+            if (!k.startsWith("pos.")) continue;
+            try {
+                String[] xy = p.getProperty(k).split(",");
+                GUI_POS.put(k.substring(4), new int[]{Integer.parseInt(xy[0].trim()), Integer.parseInt(xy[1].trim())});
+            } catch (Exception ignored) { }
         }
     }
 
-    /** Right Shift toggles the ClickGUI (polled via GLFW, so no keybinding API is needed). */
+    /**
+     * Polls module binds (including the ClickGUI key) via GLFW, so no keybinding API is needed.
+     * A module key toggles the module when no screen is open; the ClickGUI key opens/closes the menu.
+     */
     void handleGuiKey(MinecraftClient mc) {
         long h = mc.getWindow().getHandle();
-        boolean rs = GLFW.glfwGetKey(h, GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS;
-        boolean pressed = rs && !rsWas;
-        rsWas = rs;
         boolean isGui = mc.currentScreen instanceof ClickGui;
-        if (pressed) {
-            if (mc.currentScreen == null) mc.setScreen(new ClickGui());
-            else if (isGui) mc.setScreen(null);
+        if (!isGui) listening = null;
+
+        List<Mod> fired = new ArrayList<>();
+        for (Mod m : MODS) {
+            int k = m.key;
+            if (k < GLFW.GLFW_KEY_SPACE || k > GLFW.GLFW_KEY_LAST) continue;
+            if (GLFW.glfwGetKey(h, k) == GLFW.GLFW_PRESS && !keyWas[k]) fired.add(m);
+        }
+        for (Mod m : MODS) {
+            int k = m.key;
+            if (k < GLFW.GLFW_KEY_SPACE || k > GLFW.GLFW_KEY_LAST) continue;
+            keyWas[k] = GLFW.glfwGetKey(h, k) == GLFW.GLFW_PRESS;
+        }
+        if (listening == null) {
+            for (Mod m : fired) {
+                if (m == guiMod) {
+                    if (mc.currentScreen == null) mc.setScreen(new ClickGui());
+                    else if (mc.currentScreen instanceof ClickGui) mc.setScreen(null);
+                } else if (mc.currentScreen == null) {
+                    boolean v = !m.get.getAsBoolean();
+                    m.set.accept(v);
+                    mc.player.sendMessage(Text.literal(PREFIX + m.name + ": " + (v ? "ON" : "OFF")), true);
+                }
+            }
         }
         if (openGuiRequested && mc.currentScreen == null) {
             openGuiRequested = false;
@@ -1055,22 +1674,62 @@ public class LordzinkaClient implements ClientModInitializer {
         guiWasOpen = isGui;
     }
 
+    static int winHeight(String cat, boolean collapsed) {
+        int h = 16;
+        if (collapsed) return h + 1;
+        for (Mod m : MODS) {
+            if (!m.cat.equals(cat)) continue;
+            h += 14;
+            if (m.open) h += 12 * m.settings.size();
+        }
+        return h + 1;
+    }
+
     /**
-     * Meteor-style ClickGUI: draggable category windows.
-     * Left click = toggle module, right click = expand settings, drag sliders, drag header to move.
-     * Mouse is polled through GLFW so no Screen input overrides are needed.
+     * Meteor-style ClickGUI: draggable category windows with animated module rows.
+     * Left click = toggle module, right click = expand settings (every module has a Bind row),
+     * drag sliders, right click on a header = collapse the window, drag header to move.
+     * Mouse and keyboard are polled through GLFW so no Screen input overrides are needed.
      */
     static final class ClickGui extends Screen {
-        static final Map<String, int[]> POS = new LinkedHashMap<>();
         boolean wasL, wasR;
         String dragCat;
         int dox, doy;
         IntS dragInt;
+        final long openedAt = System.currentTimeMillis();
+        final boolean[] capPrev = new boolean[GLFW.GLFW_KEY_LAST + 1];
 
         ClickGui() { super(Text.literal(NAME)); }
 
         @Override
         public boolean shouldPause() { return false; }
+
+        @Override
+        public boolean shouldCloseOnEsc() { return listening == null; }
+
+        void startListening(BindS b, long h) {
+            listening = b;
+            for (int k = GLFW.GLFW_KEY_SPACE; k <= GLFW.GLFW_KEY_LAST; k++)
+                capPrev[k] = GLFW.glfwGetKey(h, k) == GLFW.GLFW_PRESS;
+        }
+
+        void captureKey(long h) {
+            for (int k = GLFW.GLFW_KEY_SPACE; k <= GLFW.GLFW_KEY_LAST; k++) {
+                boolean d = GLFW.glfwGetKey(h, k) == GLFW.GLFW_PRESS;
+                if (d && !capPrev[k] && listening != null) {
+                    if (k == GLFW.GLFW_KEY_ESCAPE) {
+                        // cancel
+                    } else if (k == GLFW.GLFW_KEY_BACKSPACE || k == GLFW.GLFW_KEY_DELETE) {
+                        if (listening.canClear) listening.set.accept(0);
+                    } else {
+                        listening.set.accept(k);
+                        keyWas[k] = true; // don't let the same press trigger the freshly bound module
+                    }
+                    listening = null;
+                }
+                capPrev[k] = d;
+            }
+        }
 
         @Override
         public void render(DrawContext g, int mx, int my, float delta) {
@@ -1083,76 +1742,143 @@ public class LordzinkaClient implements ClientModInitializer {
             wasL = l;
             wasR = r;
             if (!l) { dragCat = null; dragInt = null; }
+            if (lc && listening != null) listening = null; // click anywhere cancels; a Bind row click re-arms below
+            if (listening != null) captureKey(h);
 
-            int accent = hsv((System.currentTimeMillis() % 6000) / 6000f, 0.55f, 1f);
-            int accentFill = (accent & 0xFFFFFF) | 0xA0000000;
-            g.fill(0, 0, width, height, 0x90000000);
+            float open = Math.min(1f, (System.currentTimeMillis() - openedAt) / 180f);
+            int accent = accent();
+            int accentRgb = accent & 0xFFFFFF;
+            g.fillGradient(0, 0, width, height, ((int) (0xB0 * open) << 24), ((int) (0x60 * open) << 24) | 0x0A0A18);
             g.drawTextWithShadow(tr, NAME, 8, 6, accent);
-            g.drawTextWithShadow(tr, "LPM: wlacz/wylacz   PPM: ustawienia   przeciagnij naglowek: przesun   Right Shift: zamknij",
-                    8, height - 12, 0xFFAAAAAA);
+            g.drawTextWithShadow(tr, "v1.0  |  " + keyName(guiMod.key) + " = menu", 8 + tr.getWidth(NAME) + 6, 6, 0xFF777788);
+            String hoverInfo = null;
 
             List<String> cats = new ArrayList<>();
             for (Mod m : MODS) if (!cats.contains(m.cat)) cats.add(m.cat);
-            final int W = 112;
+            final int W = 132;
 
             for (int ci = 0; ci < cats.size(); ci++) {
                 String cat = cats.get(ci);
                 final int idx = ci;
-                int[] p = POS.computeIfAbsent(cat, k -> new int[]{12 + idx * (W + 10), 22});
+                int[] p = GUI_POS.computeIfAbsent(cat, k -> new int[]{12 + idx * (W + 10), 22});
                 if (cat.equals(dragCat)) { p[0] = mx - dox; p[1] = my - doy; }
                 int x = p[0], y = p[1];
+                boolean collapsed = COLLAPSED.contains(cat);
+                int total = winHeight(cat, collapsed);
 
-                g.fill(x, y, x + W, y + 14, 0xF0101018);
-                g.fill(x, y + 13, x + W, y + 14, accent);
-                g.drawTextWithShadow(tr, cat, x + 5, y + 3, accent);
-                if (lc && dragCat == null && dragInt == null && mx >= x && mx < x + W && my >= y && my < y + 14) {
-                    dragCat = cat;
-                    dox = mx - x;
-                    doy = my - y;
+                // shadow + body
+                g.fill(x - 2, y - 2, x + W + 2, y + total + 2, 0x30000000);
+                g.fill(x - 1, y - 1, x + W + 1, y + total + 1, 0x55000000);
+
+                int on0 = 0, all0 = 0;
+                for (Mod m : MODS) if (m.cat.equals(cat)) { all0++; if (m.get.getAsBoolean()) on0++; }
+                g.fillGradient(x, y, x + W, y + 16, 0xF0262640, 0xF0101020);
+                g.fillGradient(x, y + 15, x + W, y + 16, accent, accentRgb);
+                g.drawTextWithShadow(tr, cat, x + 6, y + 4, accent);
+                String cnt = on0 + "/" + all0 + "  " + (collapsed ? "+" : "-");
+                g.drawTextWithShadow(tr, cnt, x + W - 5 - tr.getWidth(cnt), y + 4, 0xFF9999AA);
+                if (mx >= x && mx < x + W && my >= y && my < y + 16 && dragCat == null && dragInt == null) {
+                    if (lc) {
+                        dragCat = cat;
+                        dox = mx - x;
+                        doy = my - y;
+                    }
+                    if (rc) {
+                        if (collapsed) COLLAPSED.remove(cat); else COLLAPSED.add(cat);
+                    }
                 }
-                int cy = y + 14;
+                int cy = y + 16;
+                if (collapsed) { g.fill(x, cy, x + W, cy + 1, accent); continue; }
 
                 for (Mod m : MODS) {
                     if (!m.cat.equals(cat)) continue;
                     boolean on = m.get.getAsBoolean();
-                    boolean hover = mx >= x && mx < x + W && my >= cy && my < cy + 13;
-                    g.fill(x, cy, x + W, cy + 13, on ? accentFill : (hover ? 0xE0262636 : 0xD0141420));
-                    g.drawTextWithShadow(tr, m.name, x + 5, cy + 3, on ? 0xFFFFFFFF : 0xFFAAAAAA);
-                    if (!m.settings.isEmpty())
-                        g.drawTextWithShadow(tr, m.open ? "-" : "+", x + W - 10, cy + 3, 0xFFCCCCCC);
-                    if (hover && dragCat == null && dragInt == null) {
+                    m.anim += ((on ? 1f : 0f) - m.anim) * 0.3f;
+                    boolean hover = mx >= x && mx < x + W && my >= cy && my < cy + 14 && dragCat == null && dragInt == null;
+                    int rowRgb = lerpColor(hover ? 0x2A2A3E : 0x161624, accentRgb, 0.45f * m.anim) & 0xFFFFFF;
+                    g.fill(x, cy, x + W, cy + 14, 0xE8000000 | rowRgb);
+                    if (m.anim > 0.02f) g.fill(x, cy, x + 2, cy + 14, mulAlpha(accent, m.anim));
+                    g.drawTextWithShadow(tr, m.name, x + 6, cy + 3, lerpColor(0xAAAABB, 0xFFFFFF, m.anim));
+                    String tag = (m.key > 0 ? "[" + keyName(m.key) + "] " : "") + (m.open ? "-" : "+");
+                    g.drawTextWithShadow(tr, tag, x + W - 5 - tr.getWidth(tag), cy + 3, 0xFFCCCCDD);
+                    if (hover) {
+                        hoverInfo = m.desc;
                         if (lc) m.set.accept(!on);
-                        if (rc && !m.settings.isEmpty()) m.open = !m.open;
+                        if (rc) m.open = !m.open;
                     }
-                    cy += 13;
-
+                    cy += 14;
                     if (!m.open) continue;
+
                     for (Setting s : m.settings) {
-                        boolean sh = mx >= x && mx < x + W && my >= cy && my < cy + 12;
-                        g.fill(x, cy, x + W, cy + 12, 0xE00C0C14);
-                        if (s instanceof BoolS b) {
-                            boolean v = b.get.getAsBoolean();
-                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCCC);
-                            String t = v ? "ON" : "OFF";
-                            g.drawTextWithShadow(tr, t, x + W - 6 - tr.getWidth(t), cy + 2, v ? 0xFF55FF55 : 0xFFFF5555);
-                            if (sh && lc && dragCat == null && dragInt == null) b.set.accept(!v);
-                        } else if (s instanceof IntS in) {
-                            int v = Math.max(in.min, Math.min(in.max, in.get.getAsInt()));
-                            double frac = (v - in.min) / (double) Math.max(1, in.max - in.min);
-                            g.fill(x, cy, x + (int) (W * frac), cy + 12, 0x70000000 | (accent & 0xFFFFFF));
-                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCCC);
+                        boolean sh = mx >= x && mx < x + W && my >= cy && my < cy + 12 && dragCat == null && dragInt == null;
+                        g.fill(x, cy, x + W, cy + 12, sh ? 0xF0141424 : 0xF00C0C16);
+                        g.fill(x, cy, x + 1, cy + 12, mulAlpha(accent, 0.5));
+                        if (s instanceof BoolS bs) {
+                            boolean v = bs.get.getAsBoolean();
+                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCDD);
+                            int tx = x + W - 22;
+                            g.fill(tx, cy + 2, tx + 16, cy + 10, v ? (0xFF000000 | accentRgb) : 0xFF3A3A4C);
+                            g.fill(v ? tx + 9 : tx + 1, cy + 3, v ? tx + 15 : tx + 7, cy + 9, 0xFFFFFFFF);
+                            if (sh && lc) bs.set.accept(!v);
+                        } else if (s instanceof ColorS cs) {
+                            int v = Math.max(cs.min, Math.min(cs.max, cs.get.getAsInt()));
+                            for (int sx = 0; sx < W; sx += 4)
+                                g.fill(x + sx, cy, Math.min(x + W, x + sx + 4), cy + 12, hsv(sx / (float) W, 0.6f, 0.5f));
+                            int markX = x + (int) (W * v / 359.0);
+                            g.fill(markX - 1, cy, markX + 1, cy + 12, 0xFFFFFFFF);
+                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFFFFFFF);
+                            g.fill(x + W - 16, cy + 1, x + W - 3, cy + 11, 0xFF000000);
+                            g.fill(x + W - 15, cy + 2, x + W - 4, cy + 10, hueColor(v));
+                            if (sh && lc) dragInt = cs;
+                            if (dragInt == cs && l) {
+                                double f = Math.max(0, Math.min(1, (mx - x) / (double) W));
+                                cs.set.accept(cs.min + (int) Math.round(f * (cs.max - cs.min)));
+                            }
+                        } else if (s instanceof IntS is) {
+                            int v = Math.max(is.min, Math.min(is.max, is.get.getAsInt()));
+                            double frac = (v - is.min) / (double) Math.max(1, is.max - is.min);
+                            int fw = (int) (W * frac);
+                            g.fillGradient(x, cy, x + fw, cy + 12, 0x90000000 | accentRgb, 0x40000000 | accentRgb);
+                            if (fw > 0) g.fill(x + fw - 1, cy, x + fw + 1, cy + 12, 0xFFFFFFFF);
+                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCDD);
                             String t = String.valueOf(v);
                             g.drawTextWithShadow(tr, t, x + W - 6 - tr.getWidth(t), cy + 2, 0xFFFFFFFF);
-                            if (sh && lc && dragCat == null && dragInt == null) dragInt = in;
-                            if (dragInt == in && l) {
+                            if (sh && lc) dragInt = is;
+                            if (dragInt == is && l) {
                                 double f = Math.max(0, Math.min(1, (mx - x) / (double) W));
-                                in.set.accept(in.min + (int) Math.round(f * (in.max - in.min)));
+                                is.set.accept(is.min + (int) Math.round(f * (is.max - is.min)));
                             }
+                        } else if (s instanceof EnumS es) {
+                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCDD);
+                            String t = "< " + es.current() + " >";
+                            g.drawTextWithShadow(tr, t, x + W - 6 - tr.getWidth(t), cy + 2, 0xFFFFDD66);
+                            if (sh && lc) es.cycle(1);
+                            if (sh && rc) es.cycle(-1);
+                        } else if (s instanceof BindS bd) {
+                            boolean lis = listening == bd;
+                            String t = lis ? "press a key..." : "[" + keyName(bd.get.getAsInt()) + "]";
+                            g.drawTextWithShadow(tr, "Bind", x + 9, cy + 2, 0xFFCCCCDD);
+                            g.drawTextWithShadow(tr, t, x + W - 6 - tr.getWidth(t), cy + 2, lis ? 0xFFFFFF55 : 0xFF88CCFF);
+                            if (sh && lc) startListening(bd, h);
+                            if (sh && rc && bd.canClear) { bd.set.accept(0); if (listening == bd) listening = null; }
+                            if (sh) hoverInfo = bd.canClear ? "Kliknij i nacisnij klawisz. Backspace/Delete lub PPM: usun bind. Esc: anuluj"
+                                    : "Kliknij i nacisnij klawisz. Esc: anuluj";
                         }
                         cy += 12;
                     }
                 }
-                g.fill(x, cy, x + W, cy + 1, accent);
+                g.fillGradient(x, cy, x + W, cy + 1, accent, accentRgb);
+            }
+
+            String help = "LPM: wlacz/wylacz  |  PPM: ustawienia i Bind  |  PPM na naglowku: zwin  |  "
+                    + keyName(guiMod.key) + ": zamknij";
+            g.fill(0, height - 14, width, height, 0xA0000000);
+            g.drawTextWithShadow(tr, help, 8, height - 11, 0xFFAAAAAA);
+            if (hoverInfo != null && !hoverInfo.isEmpty()) {
+                int tw = tr.getWidth(hoverInfo);
+                g.fill(6, height - 29, 12 + tw, height - 16, 0xD0101018);
+                g.fill(6, height - 29, 8, height - 16, accent);
+                g.drawTextWithShadow(tr, hoverInfo, 10, height - 26, 0xFFFFDD88);
             }
         }
     }
