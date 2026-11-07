@@ -48,6 +48,16 @@ import net.minecraft.world.chunk.WorldChunk;
 
 import java.util.*;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.IntConsumer;
+import java.util.function.IntSupplier;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.gui.screen.Screen;
+import org.lwjgl.glfw.GLFW;
 
 /**
  * Lordzinka Client (Fabric, Minecraft 1.21.11, Yarn mappings)
@@ -174,6 +184,8 @@ public class LordzinkaClient implements ClientModInitializer {
         for (Block b : Registries.BLOCK)
             if (Registries.BLOCK.getId(b).getPath().endsWith("shulker_box")) espBlocks.add(b);
 
+        buildModules();
+        loadConfig();
         ClientChunkEvents.CHUNK_LOAD.register((world, chunk) -> queue.add(chunk.getPos().toLong()));
         ClientTickEvents.END_CLIENT_TICK.register(this::tick);
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
@@ -189,6 +201,7 @@ public class LordzinkaClient implements ClientModInitializer {
     void tick(MinecraftClient mc) {
         if (mc.world == null || mc.player == null) return;
         tickCounter++;
+        handleGuiKey(mc);
 
         scanQueue(mc);
         if (radarOn) updateRadar(mc); else { nearby.clear(); inRange.clear(); }
@@ -829,6 +842,8 @@ public class LordzinkaClient implements ClientModInitializer {
 
     static void registerCommands(CommandDispatcher<FabricClientCommandSource> d) {
         var root = ClientCommandManager.literal("lz");
+        root.executes(c -> { openGuiRequested = true; return 1; });
+        root.then(ClientCommandManager.literal("gui").executes(c -> { openGuiRequested = true; return 1; }));
         root.then(toggle("hud", () -> hudOn = !hudOn));
         root.then(toggle("esp", () -> espOn = !espOn));
         root.then(toggle("blocks", () -> blocksOn = !blocksOn));
@@ -917,5 +932,228 @@ public class LordzinkaClient implements ClientModInitializer {
         }));
         var node = d.register(root);
         d.register(ClientCommandManager.literal("lordzinka").redirect(node));
+    }
+
+    // ------------------------------------------------------------------ modules + ClickGUI
+    static abstract class Setting {
+        final String name;
+        Setting(String n) { name = n; }
+    }
+
+    static final class BoolS extends Setting {
+        final BooleanSupplier get;
+        final Consumer<Boolean> set;
+        BoolS(String n, BooleanSupplier g, Consumer<Boolean> s) { super(n); get = g; set = s; }
+    }
+
+    static final class IntS extends Setting {
+        final int min, max;
+        final IntSupplier get;
+        final IntConsumer set;
+        IntS(String n, int min, int max, IntSupplier g, IntConsumer s) { super(n); this.min = min; this.max = max; get = g; set = s; }
+    }
+
+    static final class Mod {
+        final String name, cat;
+        final BooleanSupplier get;
+        final Consumer<Boolean> set;
+        final List<Setting> settings = new ArrayList<>();
+        boolean open;
+        Mod(String name, String cat, BooleanSupplier get, Consumer<Boolean> set) {
+            this.name = name; this.cat = cat; this.get = get; this.set = set;
+        }
+        Mod with(Setting s) { settings.add(s); return this; }
+    }
+
+    static final List<Mod> MODS = new ArrayList<>();
+    static boolean openGuiRequested, rsWas, guiWasOpen;
+
+    static void buildModules() {
+        MODS.add(new Mod("Chunk Finder", "Render", () -> chunksOn, v -> chunksOn = v)
+                .with(new IntS("Threshold", 1, 100, () -> threshold, v -> threshold = v)));
+        MODS.add(new Mod("Block ESP", "Render", () -> blocksOn, v -> blocksOn = v)
+                .with(new IntS("Range", 16, 512, () -> blockRange, v -> blockRange = v)));
+        MODS.add(new Mod("Amethyst ESP", "Render", () -> amethystOn, v -> amethystOn = v));
+        MODS.add(new Mod("Entity ESP", "Render", () -> espOn, v -> espOn = v)
+                .with(new BoolS("Players", () -> fPlayers, v -> fPlayers = v))
+                .with(new BoolS("Hostile", () -> fHostile, v -> fHostile = v))
+                .with(new BoolS("Passive", () -> fPassive, v -> fPassive = v))
+                .with(new BoolS("Items", () -> fItems, v -> fItems = v))
+                .with(new BoolS("Vehicles", () -> fVehicles, v -> fVehicles = v))
+                .with(new IntS("Range", 16, 512, () -> entityRange, v -> entityRange = v)));
+        MODS.add(new Mod("Nametags", "Render", () -> nametagsOn, v -> nametagsOn = v));
+        MODS.add(new Mod("Tracers", "Render", () -> tracers, v -> tracers = v));
+
+        MODS.add(new Mod("Player Radar", "Player", () -> radarOn, v -> radarOn = v)
+                .with(new IntS("Radius", 8, 128, () -> alertRadius, v -> alertRadius = v)));
+        MODS.add(new Mod("Vanish Detect", "Player", () -> vanishOn, v -> vanishOn = v));
+        MODS.add(new Mod("Auto Totem", "Player", () -> totemOn, v -> totemOn = v)
+                .with(new IntS("Delay", 0, 20, () -> totemDelay, v -> totemDelay = v)));
+
+        MODS.add(new Mod("HUD", "Client", () -> hudOn, v -> hudOn = v));
+        MODS.add(new Mod("Notifications", "Client", () -> notify, v -> notify = v));
+    }
+
+    static Path cfgPath() {
+        return FabricLoader.getInstance().getConfigDir().resolve("lordzinka.properties");
+    }
+
+    static void saveConfig() {
+        Properties p = new Properties();
+        for (Mod m : MODS) {
+            p.setProperty(m.name, String.valueOf(m.get.getAsBoolean()));
+            for (Setting s : m.settings) {
+                String k = m.name + "." + s.name;
+                if (s instanceof BoolS b) p.setProperty(k, String.valueOf(b.get.getAsBoolean()));
+                else if (s instanceof IntS i) p.setProperty(k, String.valueOf(i.get.getAsInt()));
+            }
+        }
+        try (OutputStream o = Files.newOutputStream(cfgPath())) {
+            p.store(o, NAME);
+        } catch (Exception ignored) { }
+    }
+
+    static void loadConfig() {
+        Path f = cfgPath();
+        if (!Files.exists(f)) return;
+        Properties p = new Properties();
+        try (InputStream in = Files.newInputStream(f)) {
+            p.load(in);
+        } catch (Exception e) {
+            return;
+        }
+        for (Mod m : MODS) {
+            if (p.containsKey(m.name)) m.set.accept(Boolean.parseBoolean(p.getProperty(m.name)));
+            for (Setting s : m.settings) {
+                String v = p.getProperty(m.name + "." + s.name);
+                if (v == null) continue;
+                try {
+                    if (s instanceof BoolS b) b.set.accept(Boolean.parseBoolean(v));
+                    else if (s instanceof IntS i) i.set.accept(Math.max(i.min, Math.min(i.max, Integer.parseInt(v.trim()))));
+                } catch (Exception ignored) { }
+            }
+        }
+    }
+
+    /** Right Shift toggles the ClickGUI (polled via GLFW, so no keybinding API is needed). */
+    void handleGuiKey(MinecraftClient mc) {
+        long h = mc.getWindow().getHandle();
+        boolean rs = GLFW.glfwGetKey(h, GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS;
+        boolean pressed = rs && !rsWas;
+        rsWas = rs;
+        boolean isGui = mc.currentScreen instanceof ClickGui;
+        if (pressed) {
+            if (mc.currentScreen == null) mc.setScreen(new ClickGui());
+            else if (isGui) mc.setScreen(null);
+        }
+        if (openGuiRequested && mc.currentScreen == null) {
+            openGuiRequested = false;
+            mc.setScreen(new ClickGui());
+        }
+        isGui = mc.currentScreen instanceof ClickGui;
+        if (guiWasOpen && !isGui) saveConfig();
+        guiWasOpen = isGui;
+    }
+
+    /**
+     * Meteor-style ClickGUI: draggable category windows.
+     * Left click = toggle module, right click = expand settings, drag sliders, drag header to move.
+     * Mouse is polled through GLFW so no Screen input overrides are needed.
+     */
+    static final class ClickGui extends Screen {
+        static final Map<String, int[]> POS = new LinkedHashMap<>();
+        boolean wasL, wasR;
+        String dragCat;
+        int dox, doy;
+        IntS dragInt;
+
+        ClickGui() { super(Text.literal(NAME)); }
+
+        @Override
+        public boolean shouldPause() { return false; }
+
+        @Override
+        public void render(DrawContext g, int mx, int my, float delta) {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            var tr = mc.textRenderer;
+            long h = mc.getWindow().getHandle();
+            boolean l = GLFW.glfwGetMouseButton(h, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+            boolean r = GLFW.glfwGetMouseButton(h, GLFW.GLFW_MOUSE_BUTTON_RIGHT) == GLFW.GLFW_PRESS;
+            boolean lc = l && !wasL, rc = r && !wasR;
+            wasL = l;
+            wasR = r;
+            if (!l) { dragCat = null; dragInt = null; }
+
+            int accent = hsv((System.currentTimeMillis() % 6000) / 6000f, 0.55f, 1f);
+            int accentFill = (accent & 0xFFFFFF) | 0xA0000000;
+            g.fill(0, 0, width, height, 0x90000000);
+            g.drawTextWithShadow(tr, NAME, 8, 6, accent);
+            g.drawTextWithShadow(tr, "LPM: wlacz/wylacz   PPM: ustawienia   przeciagnij naglowek: przesun   Right Shift: zamknij",
+                    8, height - 12, 0xFFAAAAAA);
+
+            List<String> cats = new ArrayList<>();
+            for (Mod m : MODS) if (!cats.contains(m.cat)) cats.add(m.cat);
+            final int W = 112;
+
+            for (int ci = 0; ci < cats.size(); ci++) {
+                String cat = cats.get(ci);
+                final int idx = ci;
+                int[] p = POS.computeIfAbsent(cat, k -> new int[]{12 + idx * (W + 10), 22});
+                if (cat.equals(dragCat)) { p[0] = mx - dox; p[1] = my - doy; }
+                int x = p[0], y = p[1];
+
+                g.fill(x, y, x + W, y + 14, 0xF0101018);
+                g.fill(x, y + 13, x + W, y + 14, accent);
+                g.drawTextWithShadow(tr, cat, x + 5, y + 3, accent);
+                if (lc && dragCat == null && dragInt == null && mx >= x && mx < x + W && my >= y && my < y + 14) {
+                    dragCat = cat;
+                    dox = mx - x;
+                    doy = my - y;
+                }
+                int cy = y + 14;
+
+                for (Mod m : MODS) {
+                    if (!m.cat.equals(cat)) continue;
+                    boolean on = m.get.getAsBoolean();
+                    boolean hover = mx >= x && mx < x + W && my >= cy && my < cy + 13;
+                    g.fill(x, cy, x + W, cy + 13, on ? accentFill : (hover ? 0xE0262636 : 0xD0141420));
+                    g.drawTextWithShadow(tr, m.name, x + 5, cy + 3, on ? 0xFFFFFFFF : 0xFFAAAAAA);
+                    if (!m.settings.isEmpty())
+                        g.drawTextWithShadow(tr, m.open ? "-" : "+", x + W - 10, cy + 3, 0xFFCCCCCC);
+                    if (hover && dragCat == null && dragInt == null) {
+                        if (lc) m.set.accept(!on);
+                        if (rc && !m.settings.isEmpty()) m.open = !m.open;
+                    }
+                    cy += 13;
+
+                    if (!m.open) continue;
+                    for (Setting s : m.settings) {
+                        boolean sh = mx >= x && mx < x + W && my >= cy && my < cy + 12;
+                        g.fill(x, cy, x + W, cy + 12, 0xE00C0C14);
+                        if (s instanceof BoolS b) {
+                            boolean v = b.get.getAsBoolean();
+                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCCC);
+                            String t = v ? "ON" : "OFF";
+                            g.drawTextWithShadow(tr, t, x + W - 6 - tr.getWidth(t), cy + 2, v ? 0xFF55FF55 : 0xFFFF5555);
+                            if (sh && lc && dragCat == null && dragInt == null) b.set.accept(!v);
+                        } else if (s instanceof IntS in) {
+                            int v = Math.max(in.min, Math.min(in.max, in.get.getAsInt()));
+                            double frac = (v - in.min) / (double) Math.max(1, in.max - in.min);
+                            g.fill(x, cy, x + (int) (W * frac), cy + 12, 0x70000000 | (accent & 0xFFFFFF));
+                            g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCCC);
+                            String t = String.valueOf(v);
+                            g.drawTextWithShadow(tr, t, x + W - 6 - tr.getWidth(t), cy + 2, 0xFFFFFFFF);
+                            if (sh && lc && dragCat == null && dragInt == null) dragInt = in;
+                            if (dragInt == in && l) {
+                                double f = Math.max(0, Math.min(1, (mx - x) / (double) W));
+                                in.set.accept(in.min + (int) Math.round(f * (in.max - in.min)));
+                            }
+                        }
+                        cy += 12;
+                    }
+                }
+                g.fill(x, cy, x + W, cy + 1, accent);
+            }
+        }
     }
 }
