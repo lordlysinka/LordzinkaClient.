@@ -25,6 +25,7 @@ import net.minecraft.client.network.AbstractClientPlayerEntity;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.network.PlayerListEntry;
+import net.minecraft.client.render.Camera;
 import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
@@ -128,13 +129,20 @@ public class LordzinkaClient implements ClientModInitializer {
     // extras
     static boolean espFill = false, espHealthBar = true, amFill = true, trHoles = true, hudNether = true;
     static int espFillAlpha = 15;
+    // v3 additions
+    static int amClusterMin = 10;                       // fully grown clusters (3x3 chunks) that count as "a player was here"
+    static boolean chunkBeams = true, chunkPulse = true;
+    static int blockStyle = 2, blockColorMode = 0, blockHue = 200;   // style: 0 outline, 1 fill, 2 both
+    static boolean radarWidget = true, radarCards = true, toastsOn = true;
+    static int radarSize = 76, radarPos = 0;
     static final Set<Block> espBlocks = new HashSet<>();
 
     // ------------------------------------------------------------------ data
     static final class ChunkInfo {
         int cx, cz, minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
         float score;
-        boolean notified;
+        boolean notified, amNotified;
+        int cMinY = Integer.MAX_VALUE, cMaxY = Integer.MIN_VALUE;   // y-range of grown amethyst clusters
         final LongArrayList esp = new LongArrayList();
         final LongArrayList amBlocks = new LongArrayList();
         final LongArrayList amBudding = new LongArrayList();
@@ -299,6 +307,7 @@ public class LordzinkaClient implements ClientModInitializer {
         info.cx = cp.x;
         info.cz = cp.z;
         info.notified = old != null && old.notified;
+        info.amNotified = old != null && old.amNotified;
 
         ChunkSection[] sections = chunk.getSectionArray();
         int bottom = world.getBottomY();
@@ -314,7 +323,11 @@ public class LordzinkaClient implements ClientModInitializer {
                         int wy = baseY + y;
                         if (isAmethyst(b)) {
                             long p = BlockPos.asLong(cp.getStartX() + x, wy, cp.getStartZ() + z);
-                            if (b == Blocks.AMETHYST_CLUSTER) { if (info.amClusters.size() < 3000) info.amClusters.add(p); }
+                            if (b == Blocks.AMETHYST_CLUSTER) {
+                                if (info.amClusters.size() < 3000) info.amClusters.add(p);
+                                if (wy < info.cMinY) info.cMinY = wy;
+                                if (wy > info.cMaxY) info.cMaxY = wy;
+                            }
                             else if (b == Blocks.BUDDING_AMETHYST) { if (info.amBudding.size() < 3000) info.amBudding.add(p); }
                             else if (info.amBlocks.size() < 6000) info.amBlocks.add(p);
                             continue;
@@ -339,9 +352,20 @@ public class LordzinkaClient implements ClientModInitializer {
         if (info.score >= threshold && !info.notified && notify) {
             info.notified = true;
             chat(mc, String.format("Suspicious chunk (score %.0f) near %d, %d", info.score, cp.getStartX() + 8, cp.getStartZ() + 8));
+            toast("Player base?", String.format("score %.0f  |  %d, %d", info.score, cp.getStartX() + 8, cp.getStartZ() + 8), 0xFFFF7755);
         }
         if (info.score < threshold) info.notified = false;
         map.put(cp.toLong(), info);
+
+        boolean amAct = isAmActive(map, info);
+        if (amAct && !info.amNotified && notify) {
+            info.amNotified = true;
+            int cl = clustersNear(map, info);
+            chat(mc, String.format("Amethyst activity near %d, %d (%d grown clusters) - a player was probably here",
+                    cp.getStartX() + 8, cp.getStartZ() + 8, cl));
+            toast("Amethyst activity", String.format("%d clusters  |  %d, %d", cl, cp.getStartX() + 8, cp.getStartZ() + 8), AM_COLOR);
+        }
+        if (!amAct) info.amNotified = false;
     }
 
     // ---- player radar
@@ -360,6 +384,7 @@ public class LordzinkaClient implements ClientModInitializer {
                     chat(mc, String.format("%s entered %dm range (%d away) at %d, %d, %d", p.getName().getString(),
                             alertRadius, (int) d, p.getBlockX(), p.getBlockY(), p.getBlockZ()));
                 if (radarSound) mc.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1.0f, 0.5f);
+                toast("Player detected", p.getName().getString() + "  |  " + (int) d + "m", 0xFFFF5555);
             }
         }
         for (Iterator<UUID> it = inRange.iterator(); it.hasNext(); ) {
@@ -512,12 +537,25 @@ public class LordzinkaClient implements ClientModInitializer {
     static final double NEAR = 0.05;
 
     static void setupCamera(MinecraftClient mc, float tp) {
-        ClientPlayerEntity p = mc.player;
-        Vec3d lp = p.getLerpedPos(tp);
-        ex = lp.x;
-        ey = lp.y + (p.getEyeY() - p.getY());
-        ez = lp.z;
-        double yaw = Math.toRadians(p.getYaw(tp)), pitch = Math.toRadians(p.getPitch(tp));
+        // Use the real render camera so the overlay stays correct in Free Cam, third person, etc.
+        Camera camera = mc.gameRenderer.getCamera();
+        double yaw, pitch;
+        if (camera != null && camera.isReady()) {
+            Vec3d cp0 = camera.getCameraPos();
+            ex = cp0.x;
+            ey = cp0.y;
+            ez = cp0.z;
+            yaw = Math.toRadians(camera.getYaw());
+            pitch = Math.toRadians(camera.getPitch());
+        } else {
+            ClientPlayerEntity p = mc.player;
+            Vec3d lp = p.getLerpedPos(tp);
+            ex = lp.x;
+            ey = lp.y + (p.getEyeY() - p.getY());
+            ez = lp.z;
+            yaw = Math.toRadians(p.getYaw(tp));
+            pitch = Math.toRadians(p.getPitch(tp));
+        }
         double sy = Math.sin(yaw), cy = Math.cos(yaw), sp = Math.sin(pitch), cp = Math.cos(pitch);
         fx = -sy * cp; fy = -sp; fz = cy * cp;
         rx = -cy; rz = -sy;
@@ -845,6 +883,49 @@ public class LordzinkaClient implements ClientModInitializer {
         if (espOn) renderEntities(g, mc, tp);
         if (nametagsOn) renderNametags(g, mc, tp);
         if (hudOn) renderHud(g, mc);
+        if (radarOn && radarWidget) renderRadarWidget(g, mc);
+        renderToasts(g, mc);
+    }
+
+    // ---- amethyst-based activity detection
+    static final int AM_COLOR = 0xFFB968FF;
+
+    static int clustersNear(Map<Long, ChunkInfo> map, ChunkInfo ci) {
+        int n = 0;
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dz = -1; dz <= 1; dz++) {
+                ChunkInfo o = map.get(ChunkPos.toLong(ci.cx + dx, ci.cz + dz));
+                if (o != null) n += o.amClusters.size();
+            }
+        return n;
+    }
+
+    /** Many fully grown amethyst clusters around a chunk = somebody has been (farming) here for a while. */
+    static boolean isAmActive(Map<Long, ChunkInfo> map, ChunkInfo ci) {
+        return amClusterMin > 0 && !ci.amClusters.isEmpty() && clustersNear(map, ci) >= amClusterMin;
+    }
+
+    static boolean isFlagged(Map<Long, ChunkInfo> map, ChunkInfo ci) {
+        return ci.score >= threshold || isAmActive(map, ci);
+    }
+
+    static void drawCard(DrawContext g, net.minecraft.client.font.TextRenderer tr, int cx, int y,
+                         String title, String l2, String l3, int col, float bar) {
+        int w = Math.max(tr.getWidth(title), Math.max(tr.getWidth(l2), tr.getWidth(l3))) + 14;
+        int x = cx - w / 2;
+        int h = 34;
+        g.fill(x - 1, y - 1, x + w + 1, y + h + 1, 0x60000000);
+        g.fillGradient(x, y, x + w, y + h, 0xE0242438, 0xE00C0C16);
+        g.fill(x, y, x + 3, y + h, col);
+        g.fill(x + 3, y + h - 2, x + w, y + h, 0x55000000);
+        g.fill(x + 3, y + h - 2, x + 3 + (int) ((w - 3) * Math.max(0f, Math.min(1f, bar))), y + h, col);
+        g.drawTextWithShadow(tr, title, x + 8, y + 3, col);
+        g.drawTextWithShadow(tr, l2, x + 8, y + 13, 0xFFDDDDEE);
+        g.drawTextWithShadow(tr, l3, x + 8, y + 22, 0xFF9999AA);
+    }
+
+    static void vline(DrawContext g, double x, double y0, double y1, double z, int col) {
+        line3(g, cam(x, y0, z), cam(x, y1, z), col);
     }
 
     void renderChunks(DrawContext g, MinecraftClient mc, Map<Long, ChunkInfo> map) {
@@ -853,30 +934,39 @@ public class LordzinkaClient implements ClientModInitializer {
         List<ChunkInfo> flagged = new ArrayList<>();
         for (ChunkInfo ci : map.values()) {
             double dx = ci.cx * 16 + 8 - ex, dz = ci.cz * 16 + 8 - ez;
-            if (ci.score >= threshold && dx * dx + dz * dz < rangeSq) flagged.add(ci);
+            if (dx * dx + dz * dz < rangeSq && isFlagged(map, ci)) flagged.add(ci);
         }
         flagged.sort(Comparator.comparingDouble(ci -> Math.pow(ci.cx * 16 + 8 - ex, 2) + Math.pow(ci.cz * 16 + 8 - ez, 2)));
         int n = Math.min(chunkMax, flagged.size());
+        double pulse = chunkPulse ? 0.8 + 0.2 * Math.sin(System.currentTimeMillis() / 300.0) : 1.0;
         for (int i = 0; i < n; i++) {
             ChunkInfo ci = flagged.get(i);
+            boolean blocksAct = ci.score >= threshold;
+            boolean amAct = isAmActive(map, ci);
             float ratio = Math.min(1f, ci.score / (threshold * 3f));
-            int col = chunkColorMode == 0
-                    ? (0xFF000000 | 0xFF0000 | ((int) (220 - 180 * ratio) << 8))
-                    : hueColor(chunkHue);
+            int col = chunkColorMode == 1 ? hueColor(chunkHue)
+                    : blocksAct ? (0xFF000000 | 0xFF0000 | ((int) (220 - 180 * ratio) << 8)) : AM_COLOR;
             double x0 = ci.cx * 16, z0 = ci.cz * 16;
+
+            int dMin = Integer.MAX_VALUE, dMax = Integer.MIN_VALUE;
+            if (blocksAct) { dMin = ci.minY; dMax = ci.maxY; }
+            if (amAct && ci.cMinY != Integer.MAX_VALUE) { dMin = Math.min(dMin, ci.cMinY); dMax = Math.max(dMax, ci.cMaxY); }
+            if (dMin == Integer.MAX_VALUE) { dMin = 64; dMax = 64; }
+
             boolean fixed = chunkYMode == 1;
             double yLow, yHigh;
             if (chunkStyle == 0) {                       // flat square
-                yLow = yHigh = fixed ? chunkY : ci.maxY + 1;
+                yLow = yHigh = fixed ? chunkY : dMax + 1;
             } else if (chunkStyle == 1) {                // column from the base upwards
-                yLow = fixed ? chunkY : ci.minY;
+                yLow = fixed ? chunkY : dMin;
                 yHigh = yLow + chunkHeight;
             } else {                                     // box around the detected blocks
-                yLow = fixed ? chunkY : ci.minY;
-                yHigh = fixed ? chunkY + chunkHeight : ci.maxY + 1;
+                yLow = fixed ? chunkY : dMin;
+                yHigh = fixed ? chunkY + chunkHeight : dMax + 1;
             }
+
             boolean doFill = chunkFill && i < 14;        // filling is the expensive part, so only the nearest chunks
-            int fillCol = withAlpha(col, chunkAlpha);
+            int fillCol = withAlpha(col, (int) (chunkAlpha * pulse));
             if (chunkStyle == 0) {
                 if (doFill)
                     fillPoly(g, new double[][]{cam(x0, yLow, z0), cam(x0 + 16, yLow, z0),
@@ -884,18 +974,41 @@ public class LordzinkaClient implements ClientModInitializer {
             } else if (doFill) {
                 fillBox3(g, x0, yLow, z0, x0 + 16, yHigh, z0 + 16, fillCol);
             }
-            if (chunkOutline) box3(g, x0, yLow, z0, x0 + 16, yHigh, z0 + 16, col);
+            if (chunkOutline) {
+                box3(g, x0, yLow, z0, x0 + 16, yHigh, z0 + 16, col);
+                if (chunkStyle == 0) {                   // inner frame gives the square some depth
+                    double in = 0.7;
+                    box3(g, x0 + in, yLow, z0 + in, x0 + 16 - in, yLow, z0 + 16 - in, mulAlpha(col, 0.45));
+                }
+            }
+            if (chunkBeams) {                            // fading light beams on the corners and in the middle
+                double top = yLow + Math.max(4, chunkHeight);
+                double[][] pts = {{x0, z0}, {x0 + 16, z0}, {x0, z0 + 16}, {x0 + 16, z0 + 16}, {x0 + 8, z0 + 8}};
+                for (int k = 0; k < pts.length; k++) {
+                    for (int seg = 0; seg < 4; seg++) {
+                        double ya = yLow + (top - yLow) * seg / 4.0, yb = yLow + (top - yLow) * (seg + 1) / 4.0;
+                        int sc = mulAlpha(col, (k == 4 ? 0.9 : 0.75) - seg * 0.2);
+                        vline(g, pts[k][0], ya, yb, pts[k][1], sc);
+                    }
+                }
+            }
             double yMid = (yLow + yHigh) / 2.0;
             if (tracers && trChunks) tracerTo(g, x0 + 8, yMid, z0 + 8, col);
-            if (chunkLabels) {
-                double[] c = cam(x0 + 8, yHigh + 1.5, z0 + 8);
+
+            if (chunkLabels && i < 10) {
+                double[] c = cam(x0 + 8, Math.max(yHigh, yLow + chunkHeight) + 1.5, z0 + 8);
                 if (c[2] > NEAR) {
                     double[] s = scr(c);
                     double dx = x0 + 8 - ex, dz = z0 + 8 - ez;
-                    String label = String.format("Chunk %d,%d  score %.0f  %dm", ci.cx, ci.cz, ci.score, (int) Math.sqrt(dx * dx + dz * dz));
-                    int tw = tr.getWidth(label);
-                    g.fill((int) s[0] - tw / 2 - 2, (int) s[1] - 1, (int) s[0] + tw / 2 + 2, (int) s[1] + 9, 0x80000000);
-                    g.drawTextWithShadow(tr, label, (int) s[0] - tw / 2, (int) s[1], col);
+                    int dist = (int) Math.sqrt(dx * dx + dz * dz);
+                    int cl = clustersNear(map, ci);
+                    String title = blocksAct && amAct ? "Player Base + Amethyst" : blocksAct ? "Player Base" : "Amethyst Activity";
+                    String l2 = String.format("X %d  Z %d  |  %dm", (int) (x0 + 8), (int) (z0 + 8), dist);
+                    String l3 = blocksAct
+                            ? String.format("score %.0f / %d", ci.score, threshold) + (amAct ? "  +" + cl + " clusters" : "")
+                            : cl + " clusters - player was here";
+                    float bar = blocksAct ? ci.score / (threshold * 3f) : cl / (Math.max(1, amClusterMin) * 3f);
+                    drawCard(g, tr, (int) s[0], (int) s[1] - 36, title, l2, l3, col, bar);
                 }
             }
         }
@@ -918,9 +1031,19 @@ public class LordzinkaClient implements ClientModInitializer {
                 boolean loaded = mc.world.getChunkManager().getWorldChunk(pos.getX() >> 4, pos.getZ() >> 4) != null;
                 if (loaded && !espBlocks.contains(block)) continue;
                 Block shown = loaded ? block : Blocks.CHEST;
-                int col = blockColor(shown);
-                double[] r = box2(g, new Box(pos), col, blockFill ? withAlpha(col, blockFillAlpha) : 0);
-                if (r == null) continue;
+                int col = blockColorMode == 1 ? hueColor(blockHue) : blockColor(shown);
+                int fillC = blockStyle >= 1 ? withAlpha(col, blockFillAlpha) : 0;
+                int lineC = blockStyle == 1 ? (col & 0xFFFFFF) : col;      // style "Fill" = no outline (alpha 0)
+                double[] r = box2(g, new Box(pos), lineC, fillC);
+                if (r == null) {
+                    // The fast 2D path gives up when a corner is behind the camera. Blocks right next to the
+                    // camera (e.g. in Free Cam) go through the clipped 3D path so they never vanish.
+                    if (distSq > 64) continue;
+                    if (fillC != 0) fillBox3(g, pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1, fillC);
+                    if (blockStyle != 1) box3(g, pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1, col);
+                    drawn++;
+                    continue;
+                }
                 drawn++;
                 if (blockLabels) {
                     String t = shown.getName().getString() + " " + (int) Math.sqrt(distSq) + "m";
@@ -1105,7 +1228,8 @@ public class LordzinkaClient implements ClientModInitializer {
             lines.add(String.format(hudFps ? "%s  |  %s  |  %d FPS" : "%s  |  %s", mc.player.getHorizontalFacing().asString(),
                     dk.replace("minecraft:", ""), mc.getCurrentFps())); cols.add(0xFFBBBBCC);
             int flagged = 0;
-            for (ChunkInfo ci : chunks(mc).values()) if (ci.score >= threshold) flagged++;
+            Map<Long, ChunkInfo> cm = chunks(mc);
+            for (ChunkInfo ci : cm.values()) if (isFlagged(cm, ci)) flagged++;
             lines.add("Suspicious chunks: " + flagged); cols.add(flagged > 0 ? 0xFFFF7755 : 0xFFBBBBCC);
             if (holesOn) { lines.add("Holes: " + holes.size()); cols.add(holes.isEmpty() ? 0xFFBBBBCC : hueColor(holeHue)); }
             if (amethystOn) {
@@ -1117,7 +1241,7 @@ public class LordzinkaClient implements ClientModInitializer {
             if (totemOn) { lines.add("Totems: " + countTotems(mc)); cols.add(0xFFFFD84A); }
             if (radarOn) {
                 lines.add("Players <" + alertRadius + "m: " + nearby.size()); cols.add(nearby.isEmpty() ? 0xFFBBBBCC : 0xFFFF5555);
-                for (int i = 0; i < Math.min(radarList, nearby.size()); i++) {
+                for (int i = 0; !radarWidget && i < Math.min(radarList, nearby.size()); i++) {
                     Nearby n = nearby.get(i);
                     lines.add(String.format("  %s  %dm  %dhp", n.name(), (int) n.dist(), (int) Math.ceil(n.hp())));
                     cols.add(0xFFFF8888);
@@ -1161,21 +1285,161 @@ public class LordzinkaClient implements ClientModInitializer {
             }
         }
 
-        if (hudBanner && radarOn && !nearby.isEmpty()) {
-            StringBuilder sb = new StringBuilder("[!] PLAYER NEARBY: ");
-            for (int i = 0; i < Math.min(3, nearby.size()); i++) {
-                if (i > 0) sb.append(", ");
-                sb.append(nearby.get(i).name()).append(" (").append((int) nearby.get(i).dist()).append("m)");
+        if (hudBanner && radarOn && !nearby.isEmpty()) renderAlertBanner(g, mc);
+    }
+
+    // ---- toasts (small slide-in notifications)
+    static final class Toast {
+        final String title, sub;
+        final int color;
+        final long t0 = System.currentTimeMillis();
+        Toast(String title, String sub, int color) { this.title = title; this.sub = sub; this.color = color; }
+    }
+
+    static final List<Toast> toasts = new ArrayList<>();
+
+    static void toast(String title, String sub, int color) {
+        if (!toastsOn) return;
+        toasts.add(new Toast(title, sub, color));
+        while (toasts.size() > 4) toasts.remove(0);
+    }
+
+    void renderToasts(DrawContext g, MinecraftClient mc) {
+        var tr = mc.textRenderer;
+        long now = System.currentTimeMillis();
+        toasts.removeIf(t -> now - t.t0 > 4400);
+        int y = 34;
+        for (Toast t : toasts) {
+            long age = now - t.t0;
+            double in = Math.min(1.0, age / 250.0);
+            double out = age > 4000 ? 1.0 - (age - 4000) / 400.0 : 1.0;
+            double k = Math.max(0.0, Math.min(in, out));
+            int w = Math.max(tr.getWidth(t.title), tr.getWidth(t.sub)) + 20;
+            int x = (int) sw / 2 - w / 2;
+            int yy = y + (int) ((1 - in) * -14);
+            int accent = mulAlpha(t.color, k);
+            g.fill(x - 1, yy - 1, x + w + 1, yy + 25, mulAlpha(0x60000000, k));
+            g.fillGradient(x, yy, x + w, yy + 24, mulAlpha(0xF0242438, k), mulAlpha(0xF00C0C16, k));
+            g.fill(x, yy, x + 3, yy + 24, accent);
+            g.fill(x + 3, yy + 22, x + 3 + (int) ((w - 3) * Math.max(0, 1 - age / 4400.0)), yy + 24, mulAlpha(t.color, 0.6 * k));
+            if (k > 0.1) {
+                int a = ((int) (255 * k)) << 24;
+                g.drawTextWithShadow(tr, t.title, x + 9, yy + 3, (t.color & 0xFFFFFF) | a);
+                g.drawTextWithShadow(tr, t.sub, x + 9, yy + 13, 0xDDDDEE | a);
             }
-            String t = sb.toString();
-            int tw = tr.getWidth(t);
-            boolean pulse = (System.currentTimeMillis() / 400) % 2 == 0;
-            int bx = (int) sw / 2 - tw / 2;
-            g.fill(bx - 9, 17, bx + tw + 9, 35, 0x50000000);
-            g.fillGradient(bx - 8, 18, bx + tw + 8, 34, pulse ? 0xD0A01818 : 0xD0601010, pulse ? 0xD0601010 : 0xD0401010);
-            g.fill(bx - 8, 18, bx + tw + 8, 19, 0xFFFF4444);
-            g.drawTextWithShadow(tr, t, bx, 23, 0xFFFFFFFF);
+            y += 28;
         }
+    }
+
+    static void ring(DrawContext g, int cx, int cy, int r, int col) {
+        int steps = Math.max(24, r * 5);
+        for (int i = 0; i < steps; i++) {
+            double a = i * Math.PI * 2 / steps;
+            int px = cx + (int) Math.round(Math.cos(a) * r), py = cy + (int) Math.round(Math.sin(a) * r);
+            g.fill(px, py, px + 1, py + 1, col);
+        }
+    }
+
+    static String fit(net.minecraft.client.font.TextRenderer tr, String s, int maxW) {
+        while (s.length() > 1 && tr.getWidth(s) > maxW) s = s.substring(0, s.length() - 1);
+        return s;
+    }
+
+    /** Mini radar with a sweep line plus a card per nearby player (name, distance, health). */
+    void renderRadarWidget(DrawContext g, MinecraftClient mc) {
+        var tr = mc.textRenderer;
+        int size = radarSize, head = 12, margin = 8;
+        boolean right = radarPos == 0 || radarPos == 2;
+        boolean bottom = radarPos == 0 || radarPos == 1;
+        int x = right ? (int) sw - size - margin : margin;
+        int y = bottom ? (int) sh - size - head - 40 : (int) (sh / 2 - (size + head) / 2);
+        int total = nearby.size();
+        int alertCol = total > 0 ? 0xFFFF5555 : 0xFF66DD99;
+        int rgb = alertCol & 0xFFFFFF;
+
+        g.fill(x - 1, y - 1, x + size + 1, y + size + head + 1, 0x60000000);
+        g.fillGradient(x, y, x + size, y + size + head, 0xE01A1A2E, 0xE00A0A14);
+        g.fillGradient(x, y, x + size, y + head, 0x60000000 | rgb, 0x10000000 | rgb);
+        g.fill(x, y + head, x + size, y + head + 1, alertCol);
+        g.drawTextWithShadow(tr, "PLAYERS", x + 4, y + 2, 0xFFFFFFFF);
+        String cnt = String.valueOf(total);
+        g.drawTextWithShadow(tr, cnt, x + size - 4 - tr.getWidth(cnt), y + 2, alertCol);
+
+        int cx = x + size / 2, cy = y + head + 1 + (size - 1) / 2, rad = size / 2 - 5;
+        ring(g, cx, cy, rad, 0x55FFFFFF);
+        ring(g, cx, cy, Math.max(2, rad * 2 / 3), 0x2AFFFFFF);
+        ring(g, cx, cy, Math.max(2, rad / 3), 0x2AFFFFFF);
+        g.fill(cx, cy - rad, cx + 1, cy + rad + 1, 0x22FFFFFF);
+        g.fill(cx - rad, cy, cx + rad + 1, cy + 1, 0x22FFFFFF);
+
+        double sweep = (System.currentTimeMillis() % 2400) / 2400.0 * Math.PI * 2;
+        for (int k = 0; k < 6; k++) {
+            double a = sweep - k * 0.1;
+            line2(g, cx, cy, cx + Math.sin(a) * rad, cy - Math.cos(a) * rad, ((int) (110 - k * 17) << 24) | rgb);
+        }
+
+        double yaw = Math.toRadians(mc.player.getYaw());
+        double fwdX = -Math.sin(yaw), fwdZ = Math.cos(yaw), rightX = -Math.cos(yaw), rightZ = -Math.sin(yaw);
+        double scale = rad / (double) Math.max(1, alertRadius);
+        for (int i = 0; i < nearby.size(); i++) {
+            Nearby nb = nearby.get(i);
+            double dx = nb.pos().getX() + 0.5 - mc.player.getX(), dz = nb.pos().getZ() + 0.5 - mc.player.getZ();
+            double px = dx * rightX + dz * rightZ, py = dx * fwdX + dz * fwdZ;
+            double len = Math.sqrt(px * px + py * py);
+            if (len > alertRadius) { px *= alertRadius / len; py *= alertRadius / len; }
+            int dxp = cx + (int) Math.round(px * scale), dyp = cy - (int) Math.round(py * scale);
+            int dc = lerpColor(0xFFFF4444, 0xFFFFDD55, (float) Math.min(1.0, nb.dist() / Math.max(1, alertRadius)));
+            g.fill(dxp - 2, dyp - 2, dxp + 3, dyp + 3, 0xFF000000);
+            g.fill(dxp - 1, dyp - 1, dxp + 2, dyp + 2, dc);
+            if (i < 3 && size >= 70) {
+                String nm = fit(tr, nb.name(), 48);
+                g.drawTextWithShadow(tr, nm, dxp - tr.getWidth(nm) / 2, dyp - 11, dc);
+            }
+        }
+        // you
+        g.fill(cx, cy - 3, cx + 1, cy - 2, 0xFFFFFFFF);
+        g.fill(cx - 1, cy - 2, cx + 2, cy - 1, 0xFFFFFFFF);
+        g.fill(cx - 2, cy - 1, cx + 3, cy, 0xFFFFFFFF);
+
+        if (radarCards && total > 0) {
+            int cn = Math.min(radarList, total), ch = 16;
+            int cy0 = bottom ? y - cn * (ch + 2) - 1 : y + head + size + 4;
+            for (int i = 0; i < cn; i++) {
+                Nearby nb = nearby.get(i);
+                int yy = cy0 + i * (ch + 2);
+                double hpRatio = Math.min(1.0, nb.hp() / 20.0);
+                int hc = hpColor(hpRatio);
+                int dc = lerpColor(0xFFFF6666, 0xFFFFDD66, (float) Math.min(1.0, nb.dist() / Math.max(1, alertRadius)));
+                g.fill(x - 1, yy - 1, x + size + 1, yy + ch + 1, 0x60000000);
+                g.fillGradient(x, yy, x + size, yy + ch, 0xE0242438, 0xE00E0E18);
+                g.fill(x, yy, x + 3, yy + ch, hc);
+                String d = (int) nb.dist() + "m";
+                g.drawTextWithShadow(tr, fit(tr, nb.name(), size - 18 - tr.getWidth(d)), x + 7, yy + 2, 0xFFFFFFFF);
+                g.drawTextWithShadow(tr, d, x + size - 4 - tr.getWidth(d), yy + 2, dc);
+                g.fill(x + 3, yy + ch - 3, x + size, yy + ch - 1, 0x66000000);
+                g.fill(x + 3, yy + ch - 3, x + 3 + (int) ((size - 3) * hpRatio), yy + ch - 1, hc);
+            }
+        }
+    }
+
+    void renderAlertBanner(DrawContext g, MinecraftClient mc) {
+        var tr = mc.textRenderer;
+        Nearby near = nearby.get(0);
+        String title = nearby.size() == 1 ? "PLAYER NEARBY" : nearby.size() + " PLAYERS NEARBY";
+        String sub = near.name() + "  " + (int) near.dist() + "m  " + (int) Math.ceil(near.hp()) + "hp"
+                + (nearby.size() > 1 ? "  (+" + (nearby.size() - 1) + ")" : "");
+        int w = Math.max(tr.getWidth(title), tr.getWidth(sub)) + 34;
+        int bx = (int) sw / 2 - w / 2, by = 4;
+        double k = 0.5 + 0.5 * Math.sin(System.currentTimeMillis() / 250.0);
+        int edge = lerpColor(0xFFFF3333, 0xFFFF9999, (float) k);
+        g.fill(bx - 1, by - 1, bx + w + 1, by + 27, 0x60000000);
+        g.fillGradient(bx, by, bx + w, by + 26, 0xE03A1018, 0xE0180A10);
+        g.fill(bx, by, bx + w, by + 1, edge);
+        g.fill(bx, by + 25, bx + w, by + 26, mulAlpha(edge, 0.5));
+        g.fill(bx + 5, by + 5, bx + 21, by + 21, edge);
+        g.drawTextWithShadow(tr, "!", bx + 12, by + 9, 0xFF300808);
+        g.drawTextWithShadow(tr, title, bx + 28, by + 4, 0xFFFF8888);
+        g.drawTextWithShadow(tr, sub, bx + 28, by + 14, 0xFFFFFFFF);
     }
 
     // ------------------------------------------------------------------ commands
@@ -1256,7 +1520,8 @@ public class LordzinkaClient implements ClientModInitializer {
             MinecraftClient mc = MinecraftClient.getInstance();
             if (mc.world == null) return 0;
             List<ChunkInfo> l = new ArrayList<>();
-            for (ChunkInfo ci : chunks(mc).values()) if (ci.score >= threshold) l.add(ci);
+            Map<Long, ChunkInfo> cm = chunks(mc);
+            for (ChunkInfo ci : cm.values()) if (isFlagged(cm, ci)) l.add(ci);
             l.sort((a, b) -> Float.compare(b.score, a.score));
             if (l.isEmpty()) c.getSource().sendFeedback(Text.literal(PREFIX + "no suspicious chunks yet"));
             for (int i = 0; i < Math.min(10, l.size()); i++) {
@@ -1301,6 +1566,7 @@ public class LordzinkaClient implements ClientModInitializer {
     // ------------------------------------------------------------------ modules + ClickGUI
     static abstract class Setting {
         final String name;
+        boolean adv;       // shown only under "Advanced"
         Setting(String n) { name = n; }
         abstract String save();
         abstract void load(String v);
@@ -1352,6 +1618,14 @@ public class LordzinkaClient implements ClientModInitializer {
         }
     }
 
+    /** The "Advanced +/-" row that reveals a module's less common settings. */
+    static final class AdvS extends Setting {
+        final Mod owner;
+        AdvS(Mod owner) { super("Advanced"); this.owner = owner; }
+        @Override String save() { return ""; }
+        @Override void load(String v) { }
+    }
+
     static final class Mod {
         final String name, cat;
         final BooleanSupplier get;
@@ -1362,12 +1636,26 @@ public class LordzinkaClient implements ClientModInitializer {
         int key = 0;
         boolean open;
         float anim;
+        boolean showAdv;
+        final AdvS advRow = new AdvS(this);
         Mod(String name, String cat, BooleanSupplier get, Consumer<Boolean> set) {
             this.name = name; this.cat = cat; this.get = get; this.set = set;
             this.bind = new BindS("Bind", () -> key, k -> key = k);
             settings.add(bind);
         }
         Mod with(Setting s) { settings.add(s); return this; }
+        Mod adv(Setting s) { s.adv = true; settings.add(s); return this; }
+        /** Rows shown in the GUI: simple settings, then the Advanced toggle and (if open) the advanced settings. */
+        List<Setting> rows() {
+            List<Setting> r = new ArrayList<>();
+            boolean hasAdv = false;
+            for (Setting s : settings) { if (!s.adv) r.add(s); else hasAdv = true; }
+            if (hasAdv) {
+                r.add(advRow);
+                if (showAdv) for (Setting s : settings) if (s.adv) r.add(s);
+            }
+            return r;
+        }
         Mod info(String d) { desc = d; return this; }
     }
 
@@ -1407,63 +1695,74 @@ public class LordzinkaClient implements ClientModInitializer {
 
     static void buildModules() {
         // ---------------- Render
+        // Every module shows only its most useful options first; the rest sits under "Advanced".
         MODS.add(new Mod("Chunk Finder", "Render", () -> chunksOn, v -> chunksOn = v)
-                .info("Znajduje podejrzane chunki (bazy graczy). Kwadrat mozna ustawic na dowolnej wysokosci Y")
-                .with(si("Threshold", 1, 200, () -> threshold, v -> threshold = v))
-                .with(si("Max Chunks", 5, 100, () -> chunkMax, v -> chunkMax = v))
-                .with(si("Range", 64, 2048, () -> chunkRange, v -> chunkRange = v))
+                .info("Znajduje bazy graczy i aktywnosc (klastry ametystu). Kwadrat mozna ustawic na wybranej wysokosci Y")
+                .with(se("Sensitivity", new String[]{"Low", "Normal", "High"},
+                        () -> threshold >= 25 ? 0 : threshold >= 12 ? 1 : 2,
+                        v -> threshold = v == 0 ? 30 : v == 1 ? 15 : 8))
+                .with(si("Clusters (0=off)", 0, 60, () -> amClusterMin, v -> amClusterMin = v))
                 .with(se("Style", new String[]{"Square", "Column", "Box"}, () -> chunkStyle, v -> chunkStyle = v))
                 .with(se("Y Mode", new String[]{"Detected", "Fixed"}, () -> chunkYMode, v -> chunkYMode = v))
                 .with(si("Y Level", -64, 320, () -> chunkY, v -> chunkY = v))
-                .with(si("Height", 1, 256, () -> chunkHeight, v -> chunkHeight = v))
-                .with(se("Color Mode", new String[]{"Heat", "Custom"}, () -> chunkColorMode, v -> chunkColorMode = v))
+                .with(se("Color Mode", new String[]{"Auto", "Custom"}, () -> chunkColorMode, v -> chunkColorMode = v))
                 .with(sc("Color", () -> chunkHue, v -> chunkHue = v))
-                .with(sb("Fill", () -> chunkFill, v -> chunkFill = v))
-                .with(si("Fill Opacity", 5, 80, () -> chunkAlpha, v -> chunkAlpha = v))
-                .with(sb("Outline", () -> chunkOutline, v -> chunkOutline = v))
-                .with(sb("Labels", () -> chunkLabels, v -> chunkLabels = v))
-                .with(si("Scan Speed", 1, 10, () -> chunkSpeed, v -> chunkSpeed = v))
-                .with(si("Rescan Ticks", 20, 600, () -> chunkRescan, v -> chunkRescan = v)));
+                .adv(si("Threshold", 1, 200, () -> threshold, v -> threshold = v))
+                .adv(si("Max Chunks", 5, 100, () -> chunkMax, v -> chunkMax = v))
+                .adv(si("Range", 64, 2048, () -> chunkRange, v -> chunkRange = v))
+                .adv(si("Height", 1, 256, () -> chunkHeight, v -> chunkHeight = v))
+                .adv(sb("Fill", () -> chunkFill, v -> chunkFill = v))
+                .adv(si("Fill Opacity", 5, 80, () -> chunkAlpha, v -> chunkAlpha = v))
+                .adv(sb("Outline", () -> chunkOutline, v -> chunkOutline = v))
+                .adv(sb("Beams", () -> chunkBeams, v -> chunkBeams = v))
+                .adv(sb("Pulse", () -> chunkPulse, v -> chunkPulse = v))
+                .adv(sb("Labels", () -> chunkLabels, v -> chunkLabels = v))
+                .adv(si("Scan Speed", 1, 10, () -> chunkSpeed, v -> chunkSpeed = v))
+                .adv(si("Rescan Ticks", 20, 600, () -> chunkRescan, v -> chunkRescan = v)));
 
         MODS.add(new Mod("Hole ESP", "Render", () -> holesOn, v -> holesOn = v)
-                .info("Podswietla pionowe dziury 1x1 (jak pomaranczowa sciana). Ustaw minimalna dlugosc i kolor")
-                .with(si("Range", 4, 32, () -> holeRange, v -> holeRange = v))
-                .with(si("Vertical Range", 8, 64, () -> holeVRange, v -> holeVRange = v))
+                .info("Podswietla pionowe dziury 1x1. Ustaw minimalna dlugosc, od ktorej dziura sie pojawia, i kolor")
                 .with(si("Min Length", 1, 32, () -> holeMin, v -> holeMin = v))
-                .with(si("Max Length", 1, 128, () -> holeMaxLen, v -> holeMaxLen = v))
-                .with(si("Max Holes", 10, 200, () -> holeCap, v -> holeCap = v))
-                .with(sb("Require Floor", () -> holeFloor, v -> holeFloor = v))
-                .with(se("Color Mode", new String[]{"Single", "Depth"}, () -> holeMode, v -> holeMode = v))
                 .with(sc("Color", () -> holeHue, v -> holeHue = v))
-                .with(sc("Deep Color", () -> holeHue2, v -> holeHue2 = v))
                 .with(sb("Fill", () -> holeFill, v -> holeFill = v))
-                .with(si("Fill Opacity", 5, 80, () -> holeAlpha, v -> holeAlpha = v))
-                .with(sb("Outline", () -> holeOutline, v -> holeOutline = v))
-                .with(sb("Labels", () -> holeLabels, v -> holeLabels = v)));
+                .adv(si("Range", 4, 32, () -> holeRange, v -> holeRange = v))
+                .adv(si("Vertical Range", 8, 64, () -> holeVRange, v -> holeVRange = v))
+                .adv(si("Max Length", 1, 128, () -> holeMaxLen, v -> holeMaxLen = v))
+                .adv(si("Max Holes", 10, 200, () -> holeCap, v -> holeCap = v))
+                .adv(sb("Require Floor", () -> holeFloor, v -> holeFloor = v))
+                .adv(se("Color Mode", new String[]{"Single", "Depth"}, () -> holeMode, v -> holeMode = v))
+                .adv(sc("Deep Color", () -> holeHue2, v -> holeHue2 = v))
+                .adv(si("Fill Opacity", 5, 80, () -> holeAlpha, v -> holeAlpha = v))
+                .adv(sb("Outline", () -> holeOutline, v -> holeOutline = v))
+                .adv(sb("Labels", () -> holeLabels, v -> holeLabels = v)));
 
         Mod blockEsp = new Mod("Block ESP", "Render", () -> blocksOn, v -> blocksOn = v)
-                .info("Podswietla skrzynki, beczki, spawnery itp. przez sciany")
+                .info("Podswietla skrzynki, beczki, spawnery itp. przez sciany. Dziala tez w Free Cam")
+                .with(se("Style", new String[]{"Outline", "Fill", "Both"}, () -> blockStyle, v -> blockStyle = v))
+                .with(se("Color Mode", new String[]{"By Type", "Custom"}, () -> blockColorMode, v -> blockColorMode = v))
+                .with(sc("Color", () -> blockHue, v -> blockHue = v))
                 .with(si("Range", 16, 512, () -> blockRange, v -> blockRange = v))
-                .with(si("Max Boxes", 50, 3000, () -> blockMax, v -> blockMax = v))
-                .with(sb("Fill", () -> blockFill, v -> blockFill = v))
-                .with(si("Fill Opacity", 5, 60, () -> blockFillAlpha, v -> blockFillAlpha = v))
-                .with(sb("Labels", () -> blockLabels, v -> blockLabels = v));
+                .adv(si("Max Boxes", 50, 3000, () -> blockMax, v -> blockMax = v))
+                .adv(si("Fill Opacity", 5, 60, () -> blockFillAlpha, v -> blockFillAlpha = v))
+                .adv(sb("Labels", () -> blockLabels, v -> blockLabels = v));
+        List<String> simpleGroups = List.of("Chests", "Ender Chests", "Barrels", "Shulkers", "Spawners");
         for (Map.Entry<String, List<Block>> en : GROUPS.entrySet()) {
             final List<Block> list = en.getValue();
-            blockEsp.with(sb(en.getKey(), () -> espBlocks.containsAll(list), v -> {
+            Setting s = sb(en.getKey(), () -> espBlocks.containsAll(list), v -> {
                 if (v) espBlocks.addAll(list); else espBlocks.removeAll(list);
                 rescanAll(MinecraftClient.getInstance());
-            }));
+            });
+            if (simpleGroups.contains(en.getKey())) blockEsp.with(s); else blockEsp.adv(s);
         }
         MODS.add(blockEsp);
 
         MODS.add(new Mod("Amethyst ESP", "Render", () -> amethystOn, v -> amethystOn = v)
                 .info("Znajduje geody i ocenia, czy ktos juz je zebral")
                 .with(si("Range", 32, 512, () -> amRange, v -> amRange = v))
-                .with(si("Max Geodes", 1, 30, () -> amMax, v -> amMax = v))
-                .with(si("Min Chance %", 0, 99, () -> amMinPct, v -> amMinPct = v))
                 .with(sb("Fill", () -> amFill, v -> amFill = v))
-                .with(sb("Mark Budding", () -> amBudding, v -> amBudding = v)));
+                .with(sb("Mark Budding", () -> amBudding, v -> amBudding = v))
+                .adv(si("Max Geodes", 1, 30, () -> amMax, v -> amMax = v))
+                .adv(si("Min Chance %", 0, 99, () -> amMinPct, v -> amMinPct = v)));
 
         MODS.add(new Mod("Entity ESP", "Render", () -> espOn, v -> espOn = v)
                 .info("Ramki wokol graczy, mobow, itemow i pojazdow")
@@ -1471,29 +1770,29 @@ public class LordzinkaClient implements ClientModInitializer {
                 .with(sb("Hostile", () -> fHostile, v -> fHostile = v))
                 .with(sb("Passive", () -> fPassive, v -> fPassive = v))
                 .with(sb("Items", () -> fItems, v -> fItems = v))
-                .with(sb("Vehicles", () -> fVehicles, v -> fVehicles = v))
-                .with(si("Range", 16, 512, () -> entityRange, v -> entityRange = v))
                 .with(se("Box", new String[]{"2D", "Corners", "3D"}, () -> espStyle, v -> espStyle = v))
-                .with(sb("Fill", () -> espFill, v -> espFill = v))
-                .with(si("Fill Opacity", 5, 60, () -> espFillAlpha, v -> espFillAlpha = v))
-                .with(sb("Health Bar", () -> espHealthBar, v -> espHealthBar = v))
-                .with(sb("Labels", () -> espLabels, v -> espLabels = v))
-                .with(sb("Distance", () -> espDistance, v -> espDistance = v))
-                .with(sc("Color Players", () -> huePlayer, v -> huePlayer = v))
-                .with(sc("Color Hostile", () -> hueHostile, v -> hueHostile = v))
-                .with(sc("Color Passive", () -> huePassive, v -> huePassive = v))
-                .with(sc("Color Items", () -> hueItem, v -> hueItem = v))
-                .with(sc("Color Vehicles", () -> hueVehicle, v -> hueVehicle = v)));
+                .with(si("Range", 16, 512, () -> entityRange, v -> entityRange = v))
+                .adv(sb("Vehicles", () -> fVehicles, v -> fVehicles = v))
+                .adv(sb("Fill", () -> espFill, v -> espFill = v))
+                .adv(si("Fill Opacity", 5, 60, () -> espFillAlpha, v -> espFillAlpha = v))
+                .adv(sb("Health Bar", () -> espHealthBar, v -> espHealthBar = v))
+                .adv(sb("Labels", () -> espLabels, v -> espLabels = v))
+                .adv(sb("Distance", () -> espDistance, v -> espDistance = v))
+                .adv(sc("Color Players", () -> huePlayer, v -> huePlayer = v))
+                .adv(sc("Color Hostile", () -> hueHostile, v -> hueHostile = v))
+                .adv(sc("Color Passive", () -> huePassive, v -> huePassive = v))
+                .adv(sc("Color Items", () -> hueItem, v -> hueItem = v))
+                .adv(sc("Color Vehicles", () -> hueVehicle, v -> hueVehicle = v)));
 
         MODS.add(new Mod("Nametags", "Render", () -> nametagsOn, v -> nametagsOn = v)
                 .info("Rozbudowane tabliczki graczy: HP, pancerz, item w rece")
-                .with(si("Range", 16, 256, () -> ntRange, v -> ntRange = v))
                 .with(sb("Health", () -> ntHealth, v -> ntHealth = v))
                 .with(sb("Distance", () -> ntDistance, v -> ntDistance = v))
                 .with(sb("Armor", () -> ntArmor, v -> ntArmor = v))
                 .with(sb("Held Item", () -> ntItem, v -> ntItem = v))
-                .with(sb("Ping", () -> ntPing, v -> ntPing = v))
-                .with(sb("Background", () -> ntBackground, v -> ntBackground = v)));
+                .adv(si("Range", 16, 256, () -> ntRange, v -> ntRange = v))
+                .adv(sb("Ping", () -> ntPing, v -> ntPing = v))
+                .adv(sb("Background", () -> ntBackground, v -> ntBackground = v)));
 
         MODS.add(new Mod("Tracers", "Render", () -> tracers, v -> tracers = v)
                 .info("Linie od ekranu do chunkow, dziur, graczy i geod")
@@ -1504,12 +1803,17 @@ public class LordzinkaClient implements ClientModInitializer {
                 .with(se("Origin", new String[]{"Bottom", "Center"}, () -> trOrigin, v -> trOrigin = v)));
 
         // ---------------- Player
-        MODS.add(new Mod("Player Radar", "Player", () -> radarOn, v -> radarOn = v)
-                .info("Ostrzega, gdy gracz wejdzie w twoj zasieg")
+        MODS.add(new Mod("Player Detection", "Player", () -> radarOn, v -> radarOn = v)
+                .info("Wykrywa graczy w poblizu: mini radar, karty z HP i dystansem, alerty")
                 .with(si("Radius", 8, 128, () -> alertRadius, v -> alertRadius = v))
-                .with(si("List Size", 1, 10, () -> radarList, v -> radarList = v))
+                .with(sb("Radar Widget", () -> radarWidget, v -> radarWidget = v))
+                .with(se("Position", new String[]{"Bottom Right", "Bottom Left", "Right Mid", "Left Mid"},
+                        () -> radarPos, v -> radarPos = v))
                 .with(sb("Chat Alerts", () -> radarChat, v -> radarChat = v))
-                .with(sb("Sound", () -> radarSound, v -> radarSound = v)));
+                .with(sb("Sound", () -> radarSound, v -> radarSound = v))
+                .adv(si("Widget Size", 56, 120, () -> radarSize, v -> radarSize = v))
+                .adv(sb("Player Cards", () -> radarCards, v -> radarCards = v))
+                .adv(si("List Size", 1, 10, () -> radarList, v -> radarList = v)));
 
         MODS.add(new Mod("Vanish Detect", "Player", () -> vanishOn, v -> vanishOn = v)
                 .info("Wykrywa ukrytych graczy (vanish) i spectatorow")
@@ -1519,10 +1823,10 @@ public class LordzinkaClient implements ClientModInitializer {
 
         MODS.add(new Mod("Auto Totem", "Player", () -> totemOn, v -> totemOn = v)
                 .info("Automatycznie wklada totem do drugiej reki")
-                .with(si("Delay", 0, 20, () -> totemDelay, v -> totemDelay = v))
                 .with(si("HP Below (0=any)", 0, 20, () -> totemHealth, v -> totemHealth = v))
-                .with(sb("Hotbar", () -> totemHotbar, v -> totemHotbar = v))
-                .with(sb("Warn When Empty", () -> totemWarn, v -> totemWarn = v)));
+                .with(sb("Warn When Empty", () -> totemWarn, v -> totemWarn = v))
+                .adv(si("Delay", 0, 20, () -> totemDelay, v -> totemDelay = v))
+                .adv(sb("Hotbar", () -> totemHotbar, v -> totemHotbar = v)));
 
         // ---------------- Client
         guiMod = new Mod("ClickGUI", "Client", () -> true, v -> { })
@@ -1542,7 +1846,8 @@ public class LordzinkaClient implements ClientModInitializer {
                 .with(sb("Module List", () -> hudList, v -> hudList = v))
                 .with(sb("Alert Banner", () -> hudBanner, v -> hudBanner = v)));
         MODS.add(new Mod("Notifications", "Client", () -> notify, v -> notify = v)
-                .info("Wiadomosci na czacie o podejrzanych chunkach"));
+                .info("Wiadomosci o podejrzanych chunkach i aktywnosci gracza")
+                .with(sb("Toasts", () -> toastsOn, v -> toastsOn = v)));
     }
 
     static int accent() {
@@ -1680,7 +1985,7 @@ public class LordzinkaClient implements ClientModInitializer {
         for (Mod m : MODS) {
             if (!m.cat.equals(cat)) continue;
             h += 14;
-            if (m.open) h += 12 * m.settings.size();
+            if (m.open) h += 12 * m.rows().size();
         }
         return h + 1;
     }
@@ -1762,6 +2067,8 @@ public class LordzinkaClient implements ClientModInitializer {
                 final int idx = ci;
                 int[] p = GUI_POS.computeIfAbsent(cat, k -> new int[]{12 + idx * (W + 10), 22});
                 if (cat.equals(dragCat)) { p[0] = mx - dox; p[1] = my - doy; }
+                p[0] = Math.max(0, Math.min(width - W, p[0]));     // keep every window reachable
+                p[1] = Math.max(0, Math.min(height - 30, p[1]));
                 int x = p[0], y = p[1];
                 boolean collapsed = COLLAPSED.contains(cat);
                 int total = winHeight(cat, collapsed);
@@ -1809,11 +2116,18 @@ public class LordzinkaClient implements ClientModInitializer {
                     cy += 14;
                     if (!m.open) continue;
 
-                    for (Setting s : m.settings) {
+                    for (Setting s : m.rows()) {
                         boolean sh = mx >= x && mx < x + W && my >= cy && my < cy + 12 && dragCat == null && dragInt == null;
                         g.fill(x, cy, x + W, cy + 12, sh ? 0xF0141424 : 0xF00C0C16);
                         g.fill(x, cy, x + 1, cy + 12, mulAlpha(accent, 0.5));
-                        if (s instanceof BoolS bs) {
+                        if (s instanceof AdvS ar) {
+                            g.drawTextWithShadow(tr, "Advanced", x + 9, cy + 2, 0xFF9999BB);
+                            String t = ar.owner.showAdv ? "-" : "+";
+                            g.drawTextWithShadow(tr, t, x + W - 8 - tr.getWidth(t), cy + 2, 0xFFCCCCDD);
+                            g.fill(x + 6, cy + 11, x + W - 6, cy + 12, 0x22FFFFFF);
+                            if (sh && (lc || rc)) ar.owner.showAdv = !ar.owner.showAdv;
+                            if (sh) hoverInfo = "Dodatkowe opcje tego modulu";
+                        } else if (s instanceof BoolS bs) {
                             boolean v = bs.get.getAsBoolean();
                             g.drawTextWithShadow(tr, s.name, x + 9, cy + 2, 0xFFCCCCDD);
                             int tx = x + W - 22;
@@ -1882,4 +2196,4 @@ public class LordzinkaClient implements ClientModInitializer {
             }
         }
     }
-}
+                }
