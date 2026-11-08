@@ -94,10 +94,10 @@ public class LordzinkaClient implements ClientModInitializer {
     static int chunkMax = 40, chunkRange = 512, chunkSpeed = 2, chunkRescan = 100;
     static boolean chunkLabels = true;
     // Block ESP
-    static int blockMax = 800, blockFillAlpha = 25;
+    static int blockMax = 400, blockFillAlpha = 35;
     static boolean blockFill = false, blockLabels = false;
     // Amethyst ESP
-    static int amRange = 256, amMax = 12, amMinPct = 0;
+    static int amRange = 256, amMax = 500, amMinPct = 0;
     static boolean amBudding = true;
     // Entity ESP
     static int espStyle = 0;
@@ -135,6 +135,9 @@ public class LordzinkaClient implements ClientModInitializer {
     static int blockStyle = 2, blockColorMode = 0, blockHue = 200;   // style: 0 outline, 1 fill, 2 both
     static boolean radarWidget = true, radarCards = true, toastsOn = true;
     static int radarSize = 76, radarPos = 0;
+    static boolean holeOpenTop = true;
+    static int amStyle = 2, amHue = 285, amAlpha = 35;
+    static int fovOffset = 0;
     static final Set<Block> espBlocks = new HashSet<>();
 
     // ------------------------------------------------------------------ data
@@ -258,7 +261,6 @@ public class LordzinkaClient implements ClientModInitializer {
         scanQueue(mc);
         if (radarOn) updateRadar(mc); else { nearby.clear(); inRange.clear(); inRangeNames.clear(); }
         if (vanishOn && tickCounter % 20 == 0) updateVanish(mc);
-        if (amethystOn && tickCounter % 40 == 0) computeGeodes(mc);
         if (holesOn) { if (tickCounter % 10 == 0) scanHoles(mc); } else if (!holes.isEmpty()) holes = new ArrayList<>();
         if (totemOn) {
             autoTotem(mc);
@@ -560,7 +562,12 @@ public class LordzinkaClient implements ClientModInitializer {
         fx = -sy * cp; fy = -sp; fz = cy * cp;
         rx = -cy; rz = -sy;
         ux = -sy * sp; uy = cp; uz = cy * sp;
-        focal = 1.0 / Math.tan(Math.toRadians(mc.options.getFov().getValue()) / 2.0);
+        double fovDeg = mc.options.getFov().getValue();
+        try {   // sprint / speed / bow effects change the real FOV; follow them
+            fovDeg *= mc.player.getFovMultiplier(mc.options.getPerspective().isFirstPerson(),
+                    mc.options.getFovEffectScale().getValue().floatValue());
+        } catch (Throwable ignored) { }
+        focal = 1.0 / Math.tan(Math.toRadians(fovDeg + fovOffset) / 2.0);
         sw = mc.getWindow().getScaledWidth();
         sh = mc.getWindow().getScaledHeight();
     }
@@ -827,7 +834,8 @@ public class LordzinkaClient implements ClientModInitializer {
                         if (runStart == Integer.MIN_VALUE) runStart = y;
                     } else if (runStart != Integer.MIN_VALUE) {
                         int len = y - runStart;
-                        if (len >= holeMin && len <= holeMaxLen && (!holeFloor || solidAt(w, m, x, runStart - 1, z))) {
+                        boolean open = !holeOpenTop || y > yMax || w.getBlockState(m.set(x, y, z)).isAir();
+                        if (open && len >= holeMin && len <= holeMaxLen && (!holeFloor || solidAt(w, m, x, runStart - 1, z))) {
                             double ddx = x + 0.5 - mc.player.getX(), ddz = z + 0.5 - mc.player.getZ();
                             out.add(new Hole(x, z, runStart, y - 1, ddx * ddx + ddz * ddz));
                         }
@@ -909,109 +917,187 @@ public class LordzinkaClient implements ClientModInitializer {
         return ci.score >= threshold || isAmActive(map, ci);
     }
 
-    static void drawCard(DrawContext g, net.minecraft.client.font.TextRenderer tr, int cx, int y,
-                         String title, String l2, String l3, int col, float bar) {
-        int w = Math.max(tr.getWidth(title), Math.max(tr.getWidth(l2), tr.getWidth(l3))) + 14;
-        int x = cx - w / 2;
-        int h = 34;
-        g.fill(x - 1, y - 1, x + w + 1, y + h + 1, 0x60000000);
-        g.fillGradient(x, y, x + w, y + h, 0xE0242438, 0xE00C0C16);
-        g.fill(x, y, x + 3, y + h, col);
-        g.fill(x + 3, y + h - 2, x + w, y + h, 0x55000000);
-        g.fill(x + 3, y + h - 2, x + 3 + (int) ((w - 3) * Math.max(0f, Math.min(1f, bar))), y + h, col);
-        g.drawTextWithShadow(tr, title, x + 8, y + 3, col);
-        g.drawTextWithShadow(tr, l2, x + 8, y + 13, 0xFFDDDDEE);
-        g.drawTextWithShadow(tr, l3, x + 8, y + 22, 0xFF9999AA);
-    }
-
     static void vline(DrawContext g, double x, double y0, double y1, double z, int col) {
         line3(g, cam(x, y0, z), cam(x, y1, z), col);
     }
 
+    // ---- Chunk Finder: touching chunks are merged into one region, only the outer border is drawn
+    int wallLeft;
+
     void renderChunks(DrawContext g, MinecraftClient mc, Map<Long, ChunkInfo> map) {
-        var tr = mc.textRenderer;
         double rangeSq = (double) chunkRange * chunkRange;
-        List<ChunkInfo> flagged = new ArrayList<>();
-        for (ChunkInfo ci : map.values()) {
+        Map<Long, ChunkInfo> flagged = new HashMap<>();
+        for (Map.Entry<Long, ChunkInfo> en : map.entrySet()) {
+            ChunkInfo ci = en.getValue();
             double dx = ci.cx * 16 + 8 - ex, dz = ci.cz * 16 + 8 - ez;
-            if (dx * dx + dz * dz < rangeSq && isFlagged(map, ci)) flagged.add(ci);
+            if (dx * dx + dz * dz < rangeSq && isFlagged(map, ci)) flagged.put(en.getKey(), ci);
         }
-        flagged.sort(Comparator.comparingDouble(ci -> Math.pow(ci.cx * 16 + 8 - ex, 2) + Math.pow(ci.cz * 16 + 8 - ez, 2)));
-        int n = Math.min(chunkMax, flagged.size());
-        double pulse = chunkPulse ? 0.8 + 0.2 * Math.sin(System.currentTimeMillis() / 300.0) : 1.0;
-        for (int i = 0; i < n; i++) {
-            ChunkInfo ci = flagged.get(i);
-            boolean blocksAct = ci.score >= threshold;
-            boolean amAct = isAmActive(map, ci);
-            float ratio = Math.min(1f, ci.score / (threshold * 3f));
-            int col = chunkColorMode == 1 ? hueColor(chunkHue)
-                    : blocksAct ? (0xFF000000 | 0xFF0000 | ((int) (220 - 180 * ratio) << 8)) : AM_COLOR;
-            double x0 = ci.cx * 16, z0 = ci.cz * 16;
+        if (flagged.isEmpty()) return;
 
-            int dMin = Integer.MAX_VALUE, dMax = Integer.MIN_VALUE;
-            if (blocksAct) { dMin = ci.minY; dMax = ci.maxY; }
-            if (amAct && ci.cMinY != Integer.MAX_VALUE) { dMin = Math.min(dMin, ci.cMinY); dMax = Math.max(dMax, ci.cMaxY); }
-            if (dMin == Integer.MAX_VALUE) { dMin = 64; dMax = 64; }
-
-            boolean fixed = chunkYMode == 1;
-            double yLow, yHigh;
-            if (chunkStyle == 0) {                       // flat square
-                yLow = yHigh = fixed ? chunkY : dMax + 1;
-            } else if (chunkStyle == 1) {                // column from the base upwards
-                yLow = fixed ? chunkY : dMin;
-                yHigh = yLow + chunkHeight;
-            } else {                                     // box around the detected blocks
-                yLow = fixed ? chunkY : dMin;
-                yHigh = fixed ? chunkY + chunkHeight : dMax + 1;
-            }
-
-            boolean doFill = chunkFill && i < 14;        // filling is the expensive part, so only the nearest chunks
-            int fillCol = withAlpha(col, (int) (chunkAlpha * pulse));
-            if (chunkStyle == 0) {
-                if (doFill)
-                    fillPoly(g, new double[][]{cam(x0, yLow, z0), cam(x0 + 16, yLow, z0),
-                            cam(x0 + 16, yLow, z0 + 16), cam(x0, yLow, z0 + 16)}, fillCol);
-            } else if (doFill) {
-                fillBox3(g, x0, yLow, z0, x0 + 16, yHigh, z0 + 16, fillCol);
-            }
-            if (chunkOutline) {
-                box3(g, x0, yLow, z0, x0 + 16, yHigh, z0 + 16, col);
-                if (chunkStyle == 0) {                   // inner frame gives the square some depth
-                    double in = 0.7;
-                    box3(g, x0 + in, yLow, z0 + in, x0 + 16 - in, yLow, z0 + 16 - in, mulAlpha(col, 0.45));
-                }
-            }
-            if (chunkBeams) {                            // fading light beams on the corners and in the middle
-                double top = yLow + Math.max(4, chunkHeight);
-                double[][] pts = {{x0, z0}, {x0 + 16, z0}, {x0, z0 + 16}, {x0 + 16, z0 + 16}, {x0 + 8, z0 + 8}};
-                for (int k = 0; k < pts.length; k++) {
-                    for (int seg = 0; seg < 4; seg++) {
-                        double ya = yLow + (top - yLow) * seg / 4.0, yb = yLow + (top - yLow) * (seg + 1) / 4.0;
-                        int sc = mulAlpha(col, (k == 4 ? 0.9 : 0.75) - seg * 0.2);
-                        vline(g, pts[k][0], ya, yb, pts[k][1], sc);
+        List<List<ChunkInfo>> regions = new ArrayList<>();
+        Set<Long> seen = new HashSet<>();
+        for (Map.Entry<Long, ChunkInfo> en : flagged.entrySet()) {
+            if (!seen.add(en.getKey())) continue;
+            List<ChunkInfo> reg = new ArrayList<>();
+            ArrayDeque<ChunkInfo> stack = new ArrayDeque<>();
+            stack.push(en.getValue());
+            while (!stack.isEmpty()) {
+                ChunkInfo c = stack.pop();
+                reg.add(c);
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dz == 0) continue;
+                        long k = ChunkPos.toLong(c.cx + dx, c.cz + dz);
+                        ChunkInfo o = flagged.get(k);
+                        if (o != null && seen.add(k)) stack.push(o);
                     }
-                }
             }
-            double yMid = (yLow + yHigh) / 2.0;
-            if (tracers && trChunks) tracerTo(g, x0 + 8, yMid, z0 + 8, col);
+            regions.add(reg);
+        }
+        regions.sort(Comparator.comparingDouble(r -> {
+            double best = Double.MAX_VALUE;
+            for (ChunkInfo c : r) {
+                double dx = c.cx * 16 + 8 - ex, dz = c.cz * 16 + 8 - ez;
+                best = Math.min(best, dx * dx + dz * dz);
+            }
+            return best;
+        }));
 
-            if (chunkLabels && i < 10) {
-                double[] c = cam(x0 + 8, Math.max(yHigh, yLow + chunkHeight) + 1.5, z0 + 8);
-                if (c[2] > NEAR) {
-                    double[] s = scr(c);
-                    double dx = x0 + 8 - ex, dz = z0 + 8 - ez;
-                    int dist = (int) Math.sqrt(dx * dx + dz * dz);
-                    int cl = clustersNear(map, ci);
-                    String title = blocksAct && amAct ? "Player Base + Amethyst" : blocksAct ? "Player Base" : "Amethyst Activity";
-                    String l2 = String.format("X %d  Z %d  |  %dm", (int) (x0 + 8), (int) (z0 + 8), dist);
-                    String l3 = blocksAct
-                            ? String.format("score %.0f / %d", ci.score, threshold) + (amAct ? "  +" + cl + " clusters" : "")
-                            : cl + " clusters - player was here";
-                    float bar = blocksAct ? ci.score / (threshold * 3f) : cl / (Math.max(1, amClusterMin) * 3f);
-                    drawCard(g, tr, (int) s[0], (int) s[1] - 36, title, l2, l3, col, bar);
+        double pulse = chunkPulse ? 0.85 + 0.15 * Math.sin(System.currentTimeMillis() / 300.0) : 1.0;
+        int chunkBudget = chunkMax, fillLeft = 28;
+        wallLeft = 80;
+        for (List<ChunkInfo> reg : regions) {
+            if (chunkBudget <= 0) break;
+            chunkBudget -= reg.size();
+            fillLeft -= drawRegion(g, map, reg, pulse, fillLeft);
+        }
+    }
+
+    /** Draws one merged region; returns how many filled polygons it used. */
+    int drawRegion(DrawContext g, Map<Long, ChunkInfo> map, List<ChunkInfo> reg, double pulse, int fillLeft) {
+        Set<Long> keys = new HashSet<>();
+        boolean anyBlocks = false;
+        float bestScore = 0;
+        int dMin = Integer.MAX_VALUE, dMax = Integer.MIN_VALUE;
+        double sumX = 0, sumZ = 0;
+        for (ChunkInfo c : reg) {
+            keys.add(ChunkPos.toLong(c.cx, c.cz));
+            sumX += c.cx * 16 + 8;
+            sumZ += c.cz * 16 + 8;
+            if (c.score >= threshold) {
+                anyBlocks = true;
+                bestScore = Math.max(bestScore, c.score);
+                dMin = Math.min(dMin, c.minY);
+                dMax = Math.max(dMax, c.maxY);
+            }
+            if (c.cMinY != Integer.MAX_VALUE && isAmActive(map, c)) {
+                dMin = Math.min(dMin, c.cMinY);
+                dMax = Math.max(dMax, c.cMaxY);
+            }
+        }
+        if (dMin == Integer.MAX_VALUE) { dMin = 64; dMax = 64; }
+
+        float ratio = Math.min(1f, bestScore / (threshold * 3f));
+        int col = chunkColorMode == 1 ? hueColor(chunkHue)
+                : anyBlocks ? (0xFF000000 | 0xFF0000 | ((int) (220 - 180 * ratio) << 8)) : AM_COLOR;
+
+        boolean fixed = chunkYMode == 1;
+        double yLow, yHigh;
+        if (chunkStyle == 0) {                       // flat square
+            yLow = yHigh = fixed ? chunkY : dMax + 1;
+        } else if (chunkStyle == 1) {                // column from the base upwards
+            yLow = fixed ? chunkY : dMin;
+            yHigh = yLow + chunkHeight;
+        } else {                                     // box around the detected blocks
+            yLow = fixed ? chunkY : dMin;
+            yHigh = fixed ? chunkY + chunkHeight : dMax + 1;
+        }
+        boolean tall = yHigh > yLow;
+
+        int fillCol = withAlpha(col, (int) (chunkAlpha * pulse));
+        int used = 0;
+        if (chunkFill) {
+            for (ChunkInfo c : reg) {
+                if (used >= fillLeft) break;
+                double x0 = c.cx * 16, z0 = c.cz * 16;
+                fillPoly(g, new double[][]{cam(x0, yHigh, z0), cam(x0 + 16, yHigh, z0),
+                        cam(x0 + 16, yHigh, z0 + 16), cam(x0, yHigh, z0 + 16)}, fillCol);
+                used++;
+                if (tall) {
+                    fillPoly(g, new double[][]{cam(x0, yLow, z0), cam(x0 + 16, yLow, z0),
+                            cam(x0 + 16, yLow, z0 + 16), cam(x0, yLow, z0 + 16)}, mulAlpha(fillCol, 0.6));
+                    used++;
                 }
             }
         }
+
+        Map<Long, int[]> verts = new HashMap<>();
+        for (ChunkInfo c : reg) {
+            int x0 = c.cx * 16, z0 = c.cz * 16;
+            if (!keys.contains(ChunkPos.toLong(c.cx - 1, c.cz))) regionEdge(g, verts, x0, z0, x0, z0 + 16, 1, yLow, yHigh, col, fillCol);
+            if (!keys.contains(ChunkPos.toLong(c.cx + 1, c.cz))) regionEdge(g, verts, x0 + 16, z0, x0 + 16, z0 + 16, 1, yLow, yHigh, col, fillCol);
+            if (!keys.contains(ChunkPos.toLong(c.cx, c.cz - 1))) regionEdge(g, verts, x0, z0, x0 + 16, z0, 2, yLow, yHigh, col, fillCol);
+            if (!keys.contains(ChunkPos.toLong(c.cx, c.cz + 1))) regionEdge(g, verts, x0, z0 + 16, x0 + 16, z0 + 16, 2, yLow, yHigh, col, fillCol);
+        }
+
+        if (chunkBeams) {                            // fading light beams on the corners of the whole region
+            double top = yLow + Math.max(4, chunkHeight);
+            for (int[] v : verts.values()) {
+                if (v[2] != 3) continue;
+                for (int seg = 0; seg < 4; seg++) {
+                    double ya = yLow + (top - yLow) * seg / 4.0, yb = yLow + (top - yLow) * (seg + 1) / 4.0;
+                    vline(g, v[0], ya, yb, v[1], mulAlpha(col, 0.85 - seg * 0.2));
+                }
+            }
+        }
+        if (tracers && trChunks) tracerTo(g, sumX / reg.size(), (yLow + yHigh) / 2.0, sumZ / reg.size(), col);
+        return used;
+    }
+
+    /** One border edge of a region: outline, optional translucent wall, and corner bookkeeping for the beams. */
+    void regionEdge(DrawContext g, Map<Long, int[]> verts, int ax, int az, int bx, int bz, int axis,
+                    double yLow, double yHigh, int col, int fillCol) {
+        if (chunkOutline) {
+            line3(g, cam(ax, yLow, az), cam(bx, yLow, bz), col);
+            if (yHigh > yLow) line3(g, cam(ax, yHigh, az), cam(bx, yHigh, bz), col);
+        }
+        if (chunkFill && yHigh > yLow && wallLeft > 0) {
+            wallLeft--;
+            fillPoly(g, new double[][]{cam(ax, yLow, az), cam(bx, yLow, bz), cam(bx, yHigh, bz), cam(ax, yHigh, az)},
+                    mulAlpha(fillCol, 0.8));
+        }
+        int[][] ends = {{ax, az}, {bx, bz}};
+        for (int[] p : ends) {
+            long k = ((long) p[0] << 32) ^ (p[1] & 0xFFFFFFFFL);
+            int[] v = verts.computeIfAbsent(k, kk -> new int[]{p[0], p[1], 0});
+            v[2] |= axis;
+        }
+    }
+
+    // ---- Block ESP / Amethyst ESP share one box drawer: true 3D edges and/or solid faces
+    static final double[] NO_LABEL = new double[0];
+
+    /** Returns the label anchor / screen rect, NO_LABEL if drawn without anchor, null if nothing was drawn. */
+    static double[] drawBlockBox(DrawContext g, BlockPos pos, int col, int style, int alphaPct, double distSq) {
+        double x = pos.getX(), y = pos.getY(), z = pos.getZ();
+        double[] c = cam(x + 0.5, y + 0.5, z + 0.5);
+        if (c[2] < -2) return null;                           // clearly behind the camera
+        if (distSq > 48 * 48) {                               // far away: cheap screen-space rectangle
+            int fillC = style >= 1 ? withAlpha(col, alphaPct) : 0;
+            int lineC = style == 1 ? (col & 0xFFFFFF) : col;  // style "Solid" = no outline (alpha 0)
+            return box2(g, new Box(pos), lineC, fillC);
+        }
+        if (c[2] > NEAR) {
+            double[] s = scr(c);
+            boolean off = s[0] < -60 || s[0] > sw + 60 || s[1] < -60 || s[1] > sh + 60;
+            if (off && distSq > 16) return null;
+        }
+        if (style >= 1) fillBox3(g, x, y, z, x + 1, y + 1, z + 1, withAlpha(col, alphaPct));
+        if (style != 1) box3(g, x, y, z, x + 1, y + 1, z + 1, col);
+        double[] t = cam(x + 0.5, y + 1.25, z + 0.5);
+        if (t[2] <= NEAR) return NO_LABEL;
+        double[] s = scr(t);
+        return new double[]{s[0], s[1], s[0], s[1]};
     }
 
     void renderBlocks(DrawContext g, MinecraftClient mc, Map<Long, ChunkInfo> map) {
@@ -1032,20 +1118,10 @@ public class LordzinkaClient implements ClientModInitializer {
                 if (loaded && !espBlocks.contains(block)) continue;
                 Block shown = loaded ? block : Blocks.CHEST;
                 int col = blockColorMode == 1 ? hueColor(blockHue) : blockColor(shown);
-                int fillC = blockStyle >= 1 ? withAlpha(col, blockFillAlpha) : 0;
-                int lineC = blockStyle == 1 ? (col & 0xFFFFFF) : col;      // style "Fill" = no outline (alpha 0)
-                double[] r = box2(g, new Box(pos), lineC, fillC);
-                if (r == null) {
-                    // The fast 2D path gives up when a corner is behind the camera. Blocks right next to the
-                    // camera (e.g. in Free Cam) go through the clipped 3D path so they never vanish.
-                    if (distSq > 64) continue;
-                    if (fillC != 0) fillBox3(g, pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1, fillC);
-                    if (blockStyle != 1) box3(g, pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1, col);
-                    drawn++;
-                    continue;
-                }
+                double[] r = drawBlockBox(g, pos, col, blockStyle, blockFillAlpha, distSq);
+                if (r == null) continue;
                 drawn++;
-                if (blockLabels) {
+                if (blockLabels && r.length == 4) {
                     String t = shown.getName().getString() + " " + (int) Math.sqrt(distSq) + "m";
                     g.drawTextWithShadow(tr, t, (int) ((r[0] + r[2]) / 2) - tr.getWidth(t) / 2, (int) r[1] - 10, col);
                 }
@@ -1053,43 +1129,24 @@ public class LordzinkaClient implements ClientModInitializer {
         }
     }
 
+    /** Amethyst ESP: highlights only fully grown amethyst clusters. */
     void renderGeodes(DrawContext g, net.minecraft.client.font.TextRenderer tr) {
-        int shown = 0;
+        MinecraftClient mc = MinecraftClient.getInstance();
         double rr = (double) amRange * amRange;
-        for (Geode ge : geodes) {
-            if (shown >= amMax) break;
-            if (ge.likelihood < amMinPct) continue;
-            double dx = ge.cx() - ex, dz = ge.cz() - ez;
-            if (dx * dx + dz * dz > rr) continue;
-            shown++;
-            int col = riskColor(ge.likelihood);
-            if (amFill) fillBox3(g, ge.minX, ge.minY, ge.minZ, ge.maxX + 1, ge.maxY + 1, ge.maxZ + 1, withAlpha(col, 16));
-            box3(g, ge.minX, ge.minY, ge.minZ, ge.maxX + 1, ge.maxY + 1, ge.maxZ + 1, col);
-            if (tracers && trGeodes) tracerTo(g, ge.cx(), ge.cy(), ge.cz(), col);
-            double[] c = cam(ge.cx(), ge.maxY + 1.5, ge.cz());
-            if (c[2] > NEAR) {
-                double[] s = scr(c);
-                String l1 = "Amethyst Geode";
-                String l2 = String.format("clusters %d | budding %d | base %.0f%%", ge.clusters, ge.budding, ge.likelihood);
-                int w = Math.max(tr.getWidth(l1), tr.getWidth(l2));
-                g.fill((int) s[0] - w / 2 - 3, (int) s[1] - 12, (int) s[0] + w / 2 + 3, (int) s[1] + 10, 0x90101018);
-                g.fill((int) s[0] - w / 2 - 3, (int) s[1] + 9, (int) s[0] + w / 2 + 3, (int) s[1] + 10, col);
-                g.drawTextWithShadow(tr, l1, (int) s[0] - tr.getWidth(l1) / 2, (int) s[1] - 10, 0xFFD58CFF);
-                g.drawTextWithShadow(tr, l2, (int) s[0] - tr.getWidth(l2) / 2, (int) s[1], col);
-            }
-        }
-        if (amBudding) {
-            int n = 0;
-            double lim = Math.min(amRange, 96);
-            double r2 = lim * lim;
-            for (ChunkInfo ci : chunks(MinecraftClient.getInstance()).values()) {
-                if (n >= 250) break;
-                for (long l : ci.amBudding) {
-                    BlockPos pos = BlockPos.fromLong(l);
-                    double dx = pos.getX() + 0.5 - ex, dy = pos.getY() + 0.5 - ey, dz = pos.getZ() + 0.5 - ez;
-                    if (dx * dx + dy * dy + dz * dz > r2) continue;
-                    if (box2(g, new Box(pos), 0xFFD58CFF, withAlpha(0xD58CFF, 28)) != null && ++n >= 250) break;
-                }
+        int col = hueColor(amHue), drawn = 0;
+        for (ChunkInfo ci : chunks(mc).values()) {
+            double cdx = ci.cx * 16 + 8 - ex, cdz = ci.cz * 16 + 8 - ez;
+            if (cdx * cdx + cdz * cdz > (amRange + 24.0) * (amRange + 24.0)) continue;
+            for (long l : ci.amClusters) {
+                if (drawn >= amMax) return;
+                BlockPos pos = BlockPos.fromLong(l);
+                double dx = pos.getX() + 0.5 - ex, dy = pos.getY() + 0.5 - ey, dz = pos.getZ() + 0.5 - ez;
+                double distSq = dx * dx + dy * dy + dz * dz;
+                if (distSq > rr) continue;
+                // skip clusters that were harvested or changed since the scan
+                if (mc.world.getChunkManager().getWorldChunk(pos.getX() >> 4, pos.getZ() >> 4) != null
+                        && mc.world.getBlockState(pos).getBlock() != Blocks.AMETHYST_CLUSTER) continue;
+                if (drawBlockBox(g, pos, col, amStyle, amAlpha, distSq) != null) drawn++;
             }
         }
     }
@@ -1232,12 +1289,6 @@ public class LordzinkaClient implements ClientModInitializer {
             for (ChunkInfo ci : cm.values()) if (isFlagged(cm, ci)) flagged++;
             lines.add("Suspicious chunks: " + flagged); cols.add(flagged > 0 ? 0xFFFF7755 : 0xFFBBBBCC);
             if (holesOn) { lines.add("Holes: " + holes.size()); cols.add(holes.isEmpty() ? 0xFFBBBBCC : hueColor(holeHue)); }
-            if (amethystOn) {
-                double best = 0;
-                for (Geode ge : geodes) best = Math.max(best, ge.likelihood);
-                lines.add(geodes.isEmpty() ? "Geodes: none" : String.format("Geodes: %d (best %.0f%%)", geodes.size(), best));
-                cols.add(geodes.isEmpty() ? 0xFFBBBBCC : riskColor(best));
-            }
             if (totemOn) { lines.add("Totems: " + countTotems(mc)); cols.add(0xFFFFD84A); }
             if (radarOn) {
                 lines.add("Players <" + alertRadius + "m: " + nearby.size()); cols.add(nearby.isEmpty() ? 0xFFBBBBCC : 0xFFFF5555);
@@ -1716,7 +1767,6 @@ public class LordzinkaClient implements ClientModInitializer {
                 .adv(sb("Outline", () -> chunkOutline, v -> chunkOutline = v))
                 .adv(sb("Beams", () -> chunkBeams, v -> chunkBeams = v))
                 .adv(sb("Pulse", () -> chunkPulse, v -> chunkPulse = v))
-                .adv(sb("Labels", () -> chunkLabels, v -> chunkLabels = v))
                 .adv(si("Scan Speed", 1, 10, () -> chunkSpeed, v -> chunkSpeed = v))
                 .adv(si("Rescan Ticks", 20, 600, () -> chunkRescan, v -> chunkRescan = v)));
 
@@ -1725,6 +1775,7 @@ public class LordzinkaClient implements ClientModInitializer {
                 .with(si("Min Length", 1, 32, () -> holeMin, v -> holeMin = v))
                 .with(sc("Color", () -> holeHue, v -> holeHue = v))
                 .with(sb("Fill", () -> holeFill, v -> holeFill = v))
+                .with(sb("Open Top", () -> holeOpenTop, v -> holeOpenTop = v))
                 .adv(si("Range", 4, 32, () -> holeRange, v -> holeRange = v))
                 .adv(si("Vertical Range", 8, 64, () -> holeVRange, v -> holeVRange = v))
                 .adv(si("Max Length", 1, 128, () -> holeMaxLen, v -> holeMaxLen = v))
@@ -1738,13 +1789,14 @@ public class LordzinkaClient implements ClientModInitializer {
 
         Mod blockEsp = new Mod("Block ESP", "Render", () -> blocksOn, v -> blocksOn = v)
                 .info("Podswietla skrzynki, beczki, spawnery itp. przez sciany. Dziala tez w Free Cam")
-                .with(se("Style", new String[]{"Outline", "Fill", "Both"}, () -> blockStyle, v -> blockStyle = v))
+                .with(se("Style", new String[]{"Edges", "Solid", "Both"}, () -> blockStyle, v -> blockStyle = v))
                 .with(se("Color Mode", new String[]{"By Type", "Custom"}, () -> blockColorMode, v -> blockColorMode = v))
                 .with(sc("Color", () -> blockHue, v -> blockHue = v))
                 .with(si("Range", 16, 512, () -> blockRange, v -> blockRange = v))
                 .adv(si("Max Boxes", 50, 3000, () -> blockMax, v -> blockMax = v))
                 .adv(si("Fill Opacity", 5, 60, () -> blockFillAlpha, v -> blockFillAlpha = v))
-                .adv(sb("Labels", () -> blockLabels, v -> blockLabels = v));
+                .adv(sb("Labels", () -> blockLabels, v -> blockLabels = v))
+                .adv(si("FOV Offset", -30, 30, () -> fovOffset, v -> fovOffset = v));
         List<String> simpleGroups = List.of("Chests", "Ender Chests", "Barrels", "Shulkers", "Spawners");
         for (Map.Entry<String, List<Block>> en : GROUPS.entrySet()) {
             final List<Block> list = en.getValue();
@@ -1757,12 +1809,12 @@ public class LordzinkaClient implements ClientModInitializer {
         MODS.add(blockEsp);
 
         MODS.add(new Mod("Amethyst ESP", "Render", () -> amethystOn, v -> amethystOn = v)
-                .info("Znajduje geody i ocenia, czy ktos juz je zebral")
+                .info("Podswietla tylko w pelni dorosle klastry ametystu")
+                .with(se("Style", new String[]{"Edges", "Solid", "Both"}, () -> amStyle, v -> amStyle = v))
+                .with(sc("Color", () -> amHue, v -> amHue = v))
                 .with(si("Range", 32, 512, () -> amRange, v -> amRange = v))
-                .with(sb("Fill", () -> amFill, v -> amFill = v))
-                .with(sb("Mark Budding", () -> amBudding, v -> amBudding = v))
-                .adv(si("Max Geodes", 1, 30, () -> amMax, v -> amMax = v))
-                .adv(si("Min Chance %", 0, 99, () -> amMinPct, v -> amMinPct = v)));
+                .adv(si("Max Clusters", 50, 3000, () -> amMax, v -> amMax = v))
+                .adv(si("Fill Opacity", 5, 80, () -> amAlpha, v -> amAlpha = v)));
 
         MODS.add(new Mod("Entity ESP", "Render", () -> espOn, v -> espOn = v)
                 .info("Ramki wokol graczy, mobow, itemow i pojazdow")
@@ -1799,7 +1851,6 @@ public class LordzinkaClient implements ClientModInitializer {
                 .with(sb("Chunks", () -> trChunks, v -> trChunks = v))
                 .with(sb("Holes", () -> trHoles, v -> trHoles = v))
                 .with(sb("Entities", () -> trEntities, v -> trEntities = v))
-                .with(sb("Geodes", () -> trGeodes, v -> trGeodes = v))
                 .with(se("Origin", new String[]{"Bottom", "Center"}, () -> trOrigin, v -> trOrigin = v)));
 
         // ---------------- Player
@@ -2196,4 +2247,4 @@ public class LordzinkaClient implements ClientModInitializer {
             }
         }
     }
-                }
+             }
